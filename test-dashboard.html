@@ -1,0 +1,582 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ADALPHA Live Dashboard</title>
+    <style>
+        :root {
+            --bg-body: #0f172a;
+            --bg-card: #1e293b;
+            --bg-card-hover: #293548;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --accent-color: #38bdf8;
+            --accent-gradient: linear-gradient(135deg, #38bdf8 0%, #3b82f6 100%);
+            --success: #22c55e;
+            --danger: #ef4444;
+            --warning: #eab308;
+            --font-family: 'Inter', system-ui, -apple-system, sans-serif;
+            --card-radius: 16px;
+            --transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            background-color: var(--bg-body);
+            color: var(--text-main);
+            font-family: var(--font-family);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 2rem;
+        }
+
+        .dashboard {
+            width: 100%;
+            max-width: 900px;
+            display: flex;
+            flex-direction: column;
+            gap: 1.5rem;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 0.5rem;
+        }
+
+        h1 {
+            font-size: 1.5rem;
+            font-weight: 700;
+            background: var(--accent-gradient);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            letter-spacing: -0.02em;
+        }
+
+        .status-pill {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 12px;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 20px;
+            font-size: 0.85rem;
+            font-weight: 500;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            transition: var(--transition);
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background-color: var(--text-muted);
+        }
+
+        .status-pill.connected {
+            border-color: rgba(34, 197, 94, 0.2);
+            background: rgba(34, 197, 94, 0.1);
+            color: var(--success);
+        }
+
+        .status-pill.connected .status-dot {
+            background-color: var(--success);
+            animation: pulse-green 2s infinite;
+        }
+
+        .status-pill.disconnected {
+            border-color: rgba(239, 68, 68, 0.2);
+            background: rgba(239, 68, 68, 0.1);
+            color: var(--danger);
+        }
+
+        .status-pill.disconnected .status-dot {
+            background-color: var(--danger);
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: 1fr 300px;
+            gap: 1.5rem;
+        }
+
+        @media (max-width: 768px) {
+            .grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .card {
+            background: var(--bg-card);
+            border-radius: var(--card-radius);
+            padding: 1.5rem;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            transition: var(--transition);
+        }
+
+        .card:hover {
+            border-color: rgba(255, 255, 255, 0.1);
+            background: var(--bg-card-hover);
+            transform: translateY(-2px);
+        }
+
+        .card-label {
+            font-size: 0.875rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 0.5rem;
+            font-weight: 600;
+        }
+
+        .metric-content {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+
+        .hashtag-name {
+            font-size: 2.5rem;
+            font-weight: 800;
+            line-height: 1.1;
+        }
+
+        .views-count {
+            font-size: 1.25rem;
+            color: var(--accent-color);
+            font-weight: 500;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .views-icon {
+            width: 20px;
+            height: 20px;
+            fill: currentColor;
+            opacity: 0.8;
+        }
+
+        .gauge-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+            height: 160px;
+        }
+
+        .gauge-svg {
+            transform: rotate(-90deg);
+            width: 140px;
+            height: 140px;
+        }
+
+        .gauge-bg {
+            fill: none;
+            stroke: rgba(255, 255, 255, 0.05);
+            stroke-width: 10;
+        }
+
+        .gauge-progress {
+            fill: none;
+            stroke: url(#gaugeGradient);
+            stroke-width: 10;
+            stroke-linecap: round;
+            stroke-dasharray: 377;
+            stroke-dashoffset: 377;
+            transition: stroke-dashoffset 1s ease-out;
+        }
+
+        .gauge-text {
+            position: absolute;
+            text-align: center;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+        }
+
+        .gauge-value {
+            font-size: 2rem;
+            font-weight: 700;
+            display: block;
+        }
+
+        .gauge-label {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+        }
+
+        .chart-card {
+            grid-column: 1 / -1;
+            min-height: 300px;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .chart-container {
+            flex-grow: 1;
+            width: 100%;
+            position: relative;
+            margin-top: 1rem;
+        }
+
+        canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+        }
+
+        @keyframes pulse-green {
+            0% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.4); }
+            70% { box-shadow: 0 0 0 10px rgba(34, 197, 94, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
+        }
+
+        .fade-in {
+            animation: fadeIn 0.5s ease-out;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .data-source {
+            margin-top: 1rem;
+            padding: 1rem;
+            background: rgba(56, 189, 248, 0.1);
+            border-radius: 8px;
+            font-size: 0.8rem;
+            color: var(--text-muted);
+        }
+
+        .data-source code {
+            background: rgba(0,0,0,0.3);
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: monospace;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="dashboard fade-in">
+        <header>
+            <h1>ADALPHA TrendStream</h1>
+            <div class="status-pill disconnected" id="connectionStatus">
+                <div class="status-dot"></div>
+                <span id="statusText">Connecting...</span>
+            </div>
+        </header>
+
+        <div class="grid">
+            <div class="card">
+                <div class="card-label">Current Trend</div>
+                <div class="metric-content">
+                    <div class="hashtag-name" id="hashtagName">--</div>
+                    <div class="views-count">
+                        <svg class="views-icon" viewBox="0 0 24 24">
+                            <path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/>
+                        </svg>
+                        <span id="viewCount">0</span> views
+                    </div>
+                </div>
+            </div>
+
+            <div class="card gauge-card">
+                <div class="card-label">VKS Score</div>
+                <div class="gauge-container">
+                    <svg class="gauge-svg">
+                        <defs>
+                            <linearGradient id="gaugeGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+                                <stop offset="0%" stop-color="#38bdf8" />
+                                <stop offset="100%" stop-color="#3b82f6" />
+                            </linearGradient>
+                        </defs>
+                        <circle class="gauge-bg" cx="70" cy="70" r="60"></circle>
+                        <circle class="gauge-progress" id="vksGauge" cx="70" cy="70" r="60"></circle>
+                    </svg>
+                    <div class="gauge-text">
+                        <span class="gauge-value" id="vksValue">0</span>
+                        <span class="gauge-label">/100</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card chart-card">
+                <div class="card-label">Views Growth - Real-time</div>
+                <div class="chart-container">
+                    <canvas id="trendChart"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <div class="data-source">
+            <strong>Data Flow:</strong>
+            Demo Generator → <code>market-stream</code> → Flink SQL → <code>vks-scores</code> → SSE Stream → This Dashboard
+            <br><br>
+            <strong>VKS Source:</strong> <span id="vksSource">Estimating from engagement...</span>
+        </div>
+    </div>
+
+    <script>
+        const CONFIG = {
+            trendsUrl: 'http://localhost:8000/api/stream/trends',
+            vksUrl: 'http://localhost:8000/api/stream/vks',
+            allUrl: 'http://localhost:8000/api/stream/all',
+            maxDataPoints: 30,
+            reconnectDelay: 3000
+        };
+
+        const state = {
+            dataPoints: [],
+            isConnected: false,
+            vksScores: {},  // Store VKS scores by hashtag
+            currentHashtag: null
+        };
+
+        const els = {
+            status: document.getElementById('connectionStatus'),
+            statusText: document.getElementById('statusText'),
+            hashtag: document.getElementById('hashtagName'),
+            views: document.getElementById('viewCount'),
+            gauge: document.getElementById('vksGauge'),
+            gaugeValue: document.getElementById('vksValue'),
+            canvas: document.getElementById('trendChart'),
+            vksSource: document.getElementById('vksSource')
+        };
+
+        const ctx = els.canvas.getContext('2d');
+
+        function resizeCanvas() {
+            const parent = els.canvas.parentElement;
+            els.canvas.width = parent.clientWidth;
+            els.canvas.height = parent.clientHeight;
+            drawChart();
+        }
+
+        window.addEventListener('resize', resizeCanvas);
+
+        function drawChart() {
+            if (!state.dataPoints.length) return;
+
+            const width = els.canvas.width;
+            const height = els.canvas.height;
+            const padding = 20;
+            const usableHeight = height - (padding * 2);
+
+            ctx.clearRect(0, 0, width, height);
+
+            const values = state.dataPoints.map(d => d.views);
+            let min = Math.min(...values);
+            let max = Math.max(...values);
+
+            min = min * 0.9;
+            max = max * 1.1;
+            if (min === max) { max = min + 10; }
+
+            const range = max - min;
+            const stepX = width / (CONFIG.maxDataPoints - 1);
+
+            const gradient = ctx.createLinearGradient(0, 0, 0, height);
+            gradient.addColorStop(0, 'rgba(56, 189, 248, 0.4)');
+            gradient.addColorStop(1, 'rgba(56, 189, 248, 0.0)');
+
+            ctx.beginPath();
+
+            state.dataPoints.forEach((point, i) => {
+                const x = width - ((state.dataPoints.length - 1 - i) * stepX);
+                const normalizedY = (point.views - min) / range;
+                const y = height - padding - (normalizedY * usableHeight);
+
+                if (i === 0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            });
+
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+            ctx.lineWidth = 3;
+            ctx.strokeStyle = '#38bdf8';
+            ctx.stroke();
+
+            ctx.lineTo(width, height);
+            ctx.lineTo(width - ((state.dataPoints.length - 1) * stepX), height);
+            ctx.fillStyle = gradient;
+            ctx.fill();
+        }
+
+        function updateTrendData(rawData) {
+            // Parse the nested structure from Kafka (market-stream)
+            let data = rawData;
+
+            // Handle market-stream message format
+            if (rawData.data && rawData.data.hashtag) {
+                data = rawData.data;
+            }
+
+            // Update hashtag and views
+            const hashtag = data.hashtag || '#Unknown';
+            els.hashtag.innerText = hashtag;
+            els.views.innerText = (data.views || 0).toLocaleString();
+            state.currentHashtag = hashtag;
+
+            // Check if we have a real VKS score from Flink SQL
+            let vksScore = state.vksScores[hashtag];
+            let vksSource = 'Flink SQL (Real-time)';
+
+            if (vksScore === undefined || vksScore === null) {
+                // Calculate VKS estimate if not provided
+                if (data.views > 0) {
+                    const engagementRate = ((data.likes || 0) + (data.comments || 0) + (data.shares || 0)) / data.views;
+                    vksScore = Math.min(engagementRate * 1000, 100);
+                    vksSource = 'Estimated (waiting for Flink SQL)';
+                } else {
+                    vksScore = 0;
+                    vksSource = 'No data';
+                }
+            }
+
+            updateVKSGauge(vksScore, vksSource);
+
+            // Update chart
+            state.dataPoints.push({
+                timestamp: Date.now(),
+                views: data.views || 0
+            });
+
+            if (state.dataPoints.length > CONFIG.maxDataPoints) {
+                state.dataPoints.shift();
+            }
+
+            drawChart();
+        }
+
+        function updateVKSScore(data) {
+            // Handle vks-scores message from Flink SQL
+            const hashtag = data.hashtag;
+            const vksScore = data.vks_score;
+
+            if (hashtag && vksScore !== undefined) {
+                state.vksScores[hashtag] = vksScore;
+                console.log(`VKS Score updated: ${hashtag} = ${vksScore}`);
+
+                // If this is the current hashtag, update the gauge immediately
+                if (hashtag === state.currentHashtag) {
+                    updateVKSGauge(vksScore, 'Flink SQL (Real-time)');
+                }
+            }
+        }
+
+        function updateVKSGauge(vksScore, source) {
+            // Update gauge
+            const score = Math.min(Math.max(vksScore, 0), 100);
+            const circumference = 2 * Math.PI * 60;
+            const offset = circumference - ((score / 100) * circumference);
+
+            els.gauge.style.strokeDashoffset = offset;
+            els.gaugeValue.innerText = score.toFixed(1);
+
+            if (score > 75) els.gaugeValue.style.color = '#22c55e';
+            else if (score > 40) els.gaugeValue.style.color = '#eab308';
+            else els.gaugeValue.style.color = '#ef4444';
+
+            // Update source indicator
+            if (els.vksSource) {
+                els.vksSource.innerText = source;
+                els.vksSource.style.color = source.includes('Flink') ? '#22c55e' : '#eab308';
+            }
+        }
+
+        function connectSSE() {
+            setConnectionStatus('connecting');
+
+            // Connect to /all endpoint to receive both trends and VKS scores
+            const evtSource = new EventSource(CONFIG.allUrl);
+
+            evtSource.onopen = () => {
+                setConnectionStatus('connected');
+                resizeCanvas();
+            };
+
+            // Listen for trend_update events (from market-stream)
+            evtSource.addEventListener('trend_update', (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    updateTrendData(data);
+                } catch (e) {
+                    console.error('Parse error (trend_update):', e);
+                }
+            });
+
+            // Listen for vks_update events (from vks-scores via Flink SQL)
+            evtSource.addEventListener('vks_update', (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    updateVKSScore(data);
+                } catch (e) {
+                    console.error('Parse error (vks_update):', e);
+                }
+            });
+
+            // Handle heartbeat events
+            evtSource.addEventListener('heartbeat', (event) => {
+                console.log('Heartbeat received');
+            });
+
+            // Also handle generic messages
+            evtSource.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    // Check what type of data this is
+                    if (data.vks_score !== undefined && data.hashtag) {
+                        updateVKSScore(data);
+                    } else if (data.hashtag || (data.data && data.data.hashtag)) {
+                        updateTrendData(data);
+                    }
+                } catch (e) {
+                    console.error('Parse error:', e);
+                }
+            };
+
+            evtSource.onerror = () => {
+                setConnectionStatus('disconnected');
+                evtSource.close();
+                setTimeout(connectSSE, CONFIG.reconnectDelay);
+            };
+        }
+
+        function setConnectionStatus(status) {
+            els.status.classList.remove('connected', 'disconnected');
+
+            if (status === 'connected') {
+                state.isConnected = true;
+                els.status.classList.add('connected');
+                els.statusText.innerText = 'Live Feed';
+            } else if (status === 'disconnected') {
+                state.isConnected = false;
+                els.status.classList.add('disconnected');
+                els.statusText.innerText = 'Disconnected';
+            } else {
+                state.isConnected = false;
+                els.statusText.innerText = 'Connecting...';
+            }
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            resizeCanvas();
+            connectSSE();
+        });
+    </script>
+</body>
+</html>
