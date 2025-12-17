@@ -16,8 +16,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
-from app.api import health, kafka_test, demo, stream
+from app.api import health, kafka_test, stream
 from app.services.kafka_client import kafka_client
+from app.services.stream_manager import stream_manager
 
 # Configure logging
 logging.basicConfig(
@@ -41,10 +42,20 @@ async def lifespan(app: FastAPI):
     # Verify Kafka connection on startup
     if settings.KAFKA_BOOTSTRAP_SERVERS:
         try:
-            metadata = kafka_client.get_cluster_metadata(timeout=10.0)
+            import asyncio
+            loop = asyncio.get_event_loop()
+            # 在线程池中执行阻塞的 Kafka 操作，避免卡死事件循环
+            metadata = await loop.run_in_executor(
+                None,
+                lambda: kafka_client.get_cluster_metadata(timeout=10.0)
+            )
             if metadata["connected"]:
                 logger.info(f"Connected to Kafka cluster: {metadata.get('cluster_id')}")
                 logger.info(f"Available topics: {metadata.get('topics')}")
+                
+                # 自动启动 Stream Manager (Kafka consumer)
+                await stream_manager.start()
+                logger.info("Stream manager started automatically")
             else:
                 logger.warning(f"Kafka connection failed: {metadata.get('error')}")
         except Exception as e:
@@ -56,6 +67,7 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Shutting down...")
+    await stream_manager.stop()
     kafka_client.close()
     logger.info("Shutdown complete")
 
@@ -104,7 +116,6 @@ app.add_middleware(
 # Include routers
 app.include_router(health.router)
 app.include_router(kafka_test.router)
-app.include_router(demo.router)
 app.include_router(stream.router)
 
 

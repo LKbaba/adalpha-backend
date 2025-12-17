@@ -231,27 +231,47 @@ class StreamManager:
 
     async def _kafka_consumer_loop(self):
         """Background task to consume Kafka messages."""
+        loop = asyncio.get_event_loop()
+        
         try:
-            # Initialize consumer
-            self._kafka_consumer = kafka_client.get_consumer(group_id="adalpha-sse-stream")
-            self._kafka_consumer.subscribe(["vks-scores", "market-stream"])
+            # Initialize consumer with unique group id to get all messages
+            import time
+            unique_group_id = f"adalpha-sse-stream-{int(time.time())}"
+            
+            # 在线程池中初始化 consumer，避免阻塞事件循环
+            self._kafka_consumer = await loop.run_in_executor(
+                None, 
+                lambda: kafka_client.get_consumer(group_id=unique_group_id)
+            )
+            await loop.run_in_executor(
+                None,
+                lambda: self._kafka_consumer.subscribe(["vks-scores", "market-stream"])
+            )
 
-            logger.info("Kafka consumer started for SSE streaming")
+            logger.info(f"Kafka consumer started for SSE streaming (group: {unique_group_id})")
+            logger.info("Subscribed to topics: vks-scores, market-stream")
 
             while self._running:
                 try:
-                    # Poll for messages (non-blocking with timeout)
-                    msg = self._kafka_consumer.poll(timeout=1.0)
+                    # 在线程池中执行阻塞的 poll 操作
+                    msg = await loop.run_in_executor(
+                        None,
+                        lambda: self._kafka_consumer.poll(timeout=1.0)
+                    )
 
                     if msg is None:
-                        await asyncio.sleep(0.1)
+                        # 没有消息，继续循环
                         continue
 
                     if msg.error():
                         if msg.error().code() == KafkaError._PARTITION_EOF:
+                            logger.debug(f"Reached end of partition for {msg.topic()}")
                             continue
                         logger.error(f"Kafka error: {msg.error()}")
                         continue
+
+                    # 收到消息，打印日志
+                    logger.info(f"📨 Received message from topic: {msg.topic()}, partition: {msg.partition()}, offset: {msg.offset()}")
 
                     # Parse message
                     topic = msg.topic()
@@ -277,16 +297,17 @@ class StreamManager:
                         event_type = "message"
 
                     # Broadcast to clients
+                    logger.info(f"📤 Broadcasting {event_type} to {self.client_count} clients: {data}")
                     self.broadcast(event_type, data, topic)
 
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
-                    logger.error(f"Error in Kafka consumer loop: {e}")
+                    logger.error(f"Error in Kafka consumer loop: {e}", exc_info=True)
                     await asyncio.sleep(1)
 
         except Exception as e:
-            logger.error(f"Failed to start Kafka consumer: {e}")
+            logger.error(f"Failed to start Kafka consumer: {e}", exc_info=True)
 
     async def _heartbeat_loop(self):
         """Send periodic heartbeat to keep SSE connections alive."""

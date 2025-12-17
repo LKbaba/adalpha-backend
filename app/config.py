@@ -109,7 +109,7 @@ class Settings(BaseSettings):
         config = self.get_kafka_config()
         config.update({
             "group.id": group_id,
-            "auto.offset.reset": "earliest",
+            "auto.offset.reset": "latest",  # 从最新消息开始消费
             "enable.auto.commit": True,
         })
         return config
