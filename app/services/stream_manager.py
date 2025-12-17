@@ -229,6 +229,67 @@ class StreamManager:
                 "error": str(e)
             }
 
+    def _calculate_vks_from_market_data(self, data: dict) -> dict:
+        """
+        Calculate VKS score from market-stream raw data.
+        
+        This is a fallback when Flink SQL is not running.
+        Uses a simplified VKS formula based on engagement metrics.
+        
+        VKS = (views * 0.1 + likes * 2 + comments * 3 + shares * 4) / 1000
+        Normalized to 0-100 range.
+        """
+        try:
+            views = data.get("views", 0) or 0
+            likes = data.get("likes", 0) or 0
+            comments = data.get("comments", 0) or 0
+            shares = data.get("shares", 0) or 0
+            saves = data.get("saves", 0) or 0
+            
+            # Debug: 打印原始数据的关键字段
+            logger.debug(f"📊 Raw metrics - views: {views}, likes: {likes}, comments: {comments}, shares: {shares}, saves: {saves}")
+            
+            # Simplified VKS calculation
+            raw_score = (
+                views * 0.001 +      # Views have low weight
+                likes * 0.5 +        # Likes moderate weight
+                comments * 1.0 +     # Comments high weight (engagement)
+                shares * 2.0 +       # Shares highest weight (virality)
+                saves * 0.8          # Saves moderate-high weight
+            )
+            
+            # Normalize to 0-100 using logarithmic scale
+            import math
+            if raw_score > 0:
+                vks_score = min(100, max(0, 10 * math.log10(raw_score + 1)))
+            else:
+                vks_score = 0
+            
+            hashtag = data.get("hashtag", data.get("tag", "unknown"))
+            if hashtag and not hashtag.startswith("#"):
+                hashtag = f"#{hashtag}"
+            
+            return {
+                "hashtag": hashtag,
+                "vks_score": round(vks_score, 2),
+                "timestamp": datetime.utcnow().isoformat(),
+                "source": "backend_calculated",
+                "metrics": {
+                    "views": views,
+                    "likes": likes,
+                    "comments": comments,
+                    "shares": shares,
+                    "saves": saves
+                }
+            }
+        except Exception as e:
+            logger.error(f"Error calculating VKS from market data: {e}")
+            return {
+                "hashtag": "unknown",
+                "vks_score": 0.0,
+                "error": str(e)
+            }
+
     async def _kafka_consumer_loop(self):
         """Background task to consume Kafka messages."""
         loop = asyncio.get_event_loop()
@@ -280,14 +341,27 @@ class StreamManager:
                     if topic == "vks-scores":
                         data = self._parse_vks_scores_message(msg)
                         event_type = "vks_update"
+                        # Broadcast to clients
+                        logger.info(f"📤 Broadcasting {event_type} to {self.client_count} clients: {data}")
+                        self.broadcast(event_type, data, topic)
+                        
                     elif topic == "market-stream":
-                        # market-stream has JSON format
+                        # market-stream has JSON format from crawler
                         value = msg.value().decode("utf-8")
                         try:
-                            data = json.loads(value)
+                            raw_data = json.loads(value)
                         except json.JSONDecodeError:
-                            data = {"raw": value}
-                        event_type = "trend_update"
+                            raw_data = {"raw": value}
+                        
+                        # 1. 发送原始 trend_update 事件
+                        logger.info(f"📤 Broadcasting trend_update to {self.client_count} clients")
+                        self.broadcast("trend_update", raw_data, topic)
+                        
+                        # 2. 同时计算 VKS 并发送 vks_update 事件 (Flink fallback)
+                        if raw_data.get("type") == "social_post":
+                            vks_data = self._calculate_vks_from_market_data(raw_data)
+                            logger.info(f"📤 Broadcasting vks_update (calculated) to {self.client_count} clients: {vks_data}")
+                            self.broadcast("vks_update", vks_data, "vks-scores")
                     else:
                         value = msg.value().decode("utf-8")
                         try:
@@ -295,10 +369,9 @@ class StreamManager:
                         except json.JSONDecodeError:
                             data = {"raw": value}
                         event_type = "message"
-
-                    # Broadcast to clients
-                    logger.info(f"📤 Broadcasting {event_type} to {self.client_count} clients: {data}")
-                    self.broadcast(event_type, data, topic)
+                        # Broadcast to clients
+                        logger.info(f"📤 Broadcasting {event_type} to {self.client_count} clients: {data}")
+                        self.broadcast(event_type, data, topic)
 
                 except asyncio.CancelledError:
                     break
