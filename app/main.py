@@ -16,7 +16,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
-from app.api import health, kafka_test, stream
+from app.api import health, kafka_test, stream, logs
 from app.services.kafka_client import kafka_client
 from app.services.stream_manager import stream_manager
 
@@ -117,6 +117,7 @@ app.add_middleware(
 app.include_router(health.router)
 app.include_router(kafka_test.router)
 app.include_router(stream.router)
+app.include_router(logs.router)
 
 
 # Error handlers
