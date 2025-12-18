@@ -246,8 +246,28 @@ class StreamManager:
             shares = data.get("shares", 0) or 0
             saves = data.get("saves", 0) or 0
             
+            # 提取平台信息
+            platform = data.get("platform", "unknown")
+            
+            # 提取作者信息
+            author = data.get("author", {})
+            if isinstance(author, dict):
+                author_name = author.get("username") or author.get("nickname") or "unknown"
+            else:
+                author_name = str(author) if author else "unknown"
+            
+            # 提取内容描述
+            description = data.get("description", "")
+            if not description:
+                content = data.get("content", {})
+                if isinstance(content, dict):
+                    description = content.get("title", "")
+            
+            # 提取帖子 ID
+            post_id = data.get("post_id") or data.get("id") or "unknown"
+            
             # Debug: 打印原始数据的关键字段
-            logger.debug(f"📊 Raw metrics - views: {views}, likes: {likes}, comments: {comments}, shares: {shares}, saves: {saves}")
+            logger.debug(f"📊 Raw metrics - platform: {platform}, views: {views}, likes: {likes}, comments: {comments}, shares: {shares}, saves: {saves}")
             
             # Simplified VKS calculation
             raw_score = (
@@ -272,6 +292,10 @@ class StreamManager:
             return {
                 "hashtag": hashtag,
                 "vks_score": round(vks_score, 2),
+                "platform": platform,
+                "post_id": post_id,
+                "author": author_name,
+                "description": description[:200] if description else "",  # 截断过长的描述
                 "timestamp": datetime.utcnow().isoformat(),
                 "source": "backend_calculated",
                 "metrics": {
@@ -287,6 +311,7 @@ class StreamManager:
             return {
                 "hashtag": "unknown",
                 "vks_score": 0.0,
+                "platform": "unknown",
                 "error": str(e)
             }
 
