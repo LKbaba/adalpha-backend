@@ -23,6 +23,7 @@ from confluent_kafka import Consumer, KafkaError
 
 from app.config import get_settings
 from app.services.kafka_client import kafka_client
+from app.services.adaptive_trend_scorer import adaptive_trend_scorer
 
 logger = logging.getLogger(__name__)
 
@@ -231,23 +232,26 @@ class StreamManager:
 
     def _calculate_vks_from_market_data(self, data: dict) -> dict:
         """
-        Calculate VKS score from market-stream raw data.
+        Calculate Trend Score from market-stream raw data using adaptive_trend_scorer.
         
-        This is a fallback when Flink SQL is not running.
-        Uses a simplified VKS formula based on engagement metrics.
+        Uses the full 6-dimension scoring system:
+        - H (Hotness): 热度
+        - V (Velocity): 增速
+        - D (Density): 密度
+        - F (Feasibility): 可行性
+        - M (Monetization): 商业化
+        - R (Risk): 风险
         
-        VKS = (views * 0.1 + likes * 2 + comments * 3 + shares * 4) / 1000
-        Normalized to 0-100 range.
+        Formula: trend_score = 0.20*H + 0.30*V + 0.15*D + 0.15*F + 0.20*M - 0.25*R
         """
         try:
-            views = data.get("views", 0) or 0
-            likes = data.get("likes", 0) or 0
-            comments = data.get("comments", 0) or 0
-            shares = data.get("shares", 0) or 0
-            saves = data.get("saves", 0) or 0
-            
             # 提取平台信息
             platform = data.get("platform", "unknown")
+            
+            # 提取 hashtag
+            hashtag = data.get("hashtag", data.get("tag", "unknown"))
+            if hashtag and not hashtag.startswith("#"):
+                hashtag = f"#{hashtag}"
             
             # 提取作者信息
             author = data.get("author", {})
@@ -266,53 +270,91 @@ class StreamManager:
             # 提取帖子 ID
             post_id = data.get("post_id") or data.get("id") or "unknown"
             
-            # Debug: 打印原始数据的关键字段
-            logger.debug(f"📊 Raw metrics - platform: {platform}, views: {views}, likes: {likes}, comments: {comments}, shares: {shares}, saves: {saves}")
+            # 构建爬虫数据格式供 adaptive_trend_scorer 使用
+            crawl_item = {
+                "platform": platform,
+                "id": post_id,
+                "stats": data.get("stats", {
+                    "views": data.get("views", 0) or 0,
+                    "likes": data.get("likes", 0) or 0,
+                    "comments": data.get("comments", 0) or 0,
+                    "shares": data.get("shares", 0) or 0,
+                    "saves": data.get("saves", 0) or 0,
+                    # Reddit 特殊字段
+                    "upvotes": data.get("upvotes", 0) or 0,
+                    "downvotes": data.get("downvotes", 0) or 0,
+                    "score": data.get("score", 0) or 0,
+                })
+            }
             
-            # Simplified VKS calculation
-            raw_score = (
-                views * 0.001 +      # Views have low weight
-                likes * 0.5 +        # Likes moderate weight
-                comments * 1.0 +     # Comments high weight (engagement)
-                shares * 2.0 +       # Shares highest weight (virality)
-                saves * 0.8          # Saves moderate-high weight
+            # 如果 stats 字段不存在，从顶层提取
+            if not data.get("stats"):
+                crawl_item["stats"] = {
+                    "views": data.get("views", 0) or 0,
+                    "likes": data.get("likes", 0) or 0,
+                    "comments": data.get("comments", 0) or 0,
+                    "shares": data.get("shares", 0) or 0,
+                    "saves": data.get("saves", 0) or 0,
+                    "upvotes": data.get("upvotes", 0) or 0,
+                    "downvotes": data.get("downvotes", 0) or 0,
+                    "score": data.get("score", 0) or 0,
+                }
+            
+            # 使用 adaptive_trend_scorer 计算完整的 Trend Score
+            score_result = adaptive_trend_scorer.compute_from_crawl_item(
+                item=crawl_item,
+                keyword=hashtag.lstrip("#")
             )
             
-            # Normalize to 0-100 using logarithmic scale
-            import math
-            if raw_score > 0:
-                vks_score = min(100, max(0, 10 * math.log10(raw_score + 1)))
-            else:
-                vks_score = 0
+            logger.debug(f"📊 Adaptive Trend Score - platform: {platform}, keyword: {hashtag}, "
+                        f"trend_score: {score_result.get('trend_score')}, "
+                        f"H={score_result.get('H')}, V={score_result.get('V')}, "
+                        f"D={score_result.get('D')}, F={score_result.get('F')}, "
+                        f"M={score_result.get('M')}, R={score_result.get('R')}")
             
-            hashtag = data.get("hashtag", data.get("tag", "unknown"))
-            if hashtag and not hashtag.startswith("#"):
-                hashtag = f"#{hashtag}"
-            
+            # 返回完整的评分结果
             return {
                 "hashtag": hashtag,
-                "vks_score": round(vks_score, 2),
+                "vks_score": score_result.get("trend_score", 0),  # 兼容旧字段名
+                "trend_score": score_result.get("trend_score", 0),
                 "platform": platform,
                 "post_id": post_id,
                 "author": author_name,
-                "description": description[:200] if description else "",  # 截断过长的描述
+                "description": description[:200] if description else "",
                 "timestamp": datetime.utcnow().isoformat(),
-                "source": "backend_calculated",
-                "metrics": {
-                    "views": views,
-                    "likes": likes,
-                    "comments": comments,
-                    "shares": shares,
-                    "saves": saves
-                }
+                "source": "adaptive_trend_scorer",
+                # 6 维度分数
+                "dimensions": {
+                    "H": score_result.get("H", 0),  # 热度
+                    "V": score_result.get("V", 0),  # 增速
+                    "D": score_result.get("D", 0),  # 密度
+                    "F": score_result.get("F", 0),  # 可行性
+                    "M": score_result.get("M", 0),  # 商业化
+                    "R": score_result.get("R", 0),  # 风险
+                },
+                # 元数据
+                "lifecycle": score_result.get("lifecycle", "unknown"),
+                "priority": score_result.get("priority", "P3"),
+                "agent_ready": score_result.get("agent_ready", False),
+                "category": score_result.get("category", "general"),
+                # 原始指标
+                "metrics": score_result.get("raw_metrics", {
+                    "views": crawl_item["stats"].get("views", 0),
+                    "likes": crawl_item["stats"].get("likes", 0),
+                    "comments": crawl_item["stats"].get("comments", 0),
+                    "shares": crawl_item["stats"].get("shares", 0),
+                    "saves": crawl_item["stats"].get("saves", 0),
+                })
             }
         except Exception as e:
-            logger.error(f"Error calculating VKS from market data: {e}")
+            logger.error(f"Error calculating Trend Score from market data: {e}", exc_info=True)
             return {
-                "hashtag": "unknown",
+                "hashtag": data.get("hashtag", data.get("tag", "unknown")),
                 "vks_score": 0.0,
-                "platform": "unknown",
-                "error": str(e)
+                "trend_score": 0.0,
+                "platform": data.get("platform", "unknown"),
+                "error": str(e),
+                "source": "error_fallback"
             }
 
     async def _kafka_consumer_loop(self):
