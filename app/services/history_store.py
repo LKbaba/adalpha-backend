@@ -83,6 +83,8 @@ class HistoryStore:
                     author TEXT DEFAULT '',
                     description TEXT DEFAULT '',
                     post_id TEXT DEFAULT '',
+                    content_url TEXT DEFAULT '',
+                    cover_url TEXT DEFAULT '',
                     lifecycle TEXT DEFAULT 'unknown',
                     priority TEXT DEFAULT 'P3',
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
@@ -133,6 +135,8 @@ class HistoryStore:
         author: str = "",
         description: str = "",
         post_id: str = "",
+        content_url: str = "",
+        cover_url: str = "",
         lifecycle: str = "unknown",
         priority: str = "P3"
     ) -> dict:
@@ -148,6 +152,8 @@ class HistoryStore:
             author: 作者
             description: 内容描述
             post_id: 帖子ID
+            content_url: 内容链接
+            cover_url: 封面图链接
             lifecycle: 生命周期阶段
             priority: 优先级
             
@@ -170,6 +176,8 @@ class HistoryStore:
                 "author": author,
                 "description": description[:500] if description else "",
                 "post_id": post_id,
+                "content_url": content_url,
+                "cover_url": cover_url,
                 "lifecycle": lifecycle,
                 "priority": priority
             }
@@ -179,8 +187,8 @@ class HistoryStore:
                 cursor.execute("""
                     INSERT INTO score_records 
                     (id, timestamp, platform, hashtag, trend_score, dimensions, 
-                     raw_data, author, description, post_id, lifecycle, priority)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     raw_data, author, description, post_id, content_url, cover_url, lifecycle, priority)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     record_id,
                     now.isoformat(),
@@ -192,6 +200,8 @@ class HistoryStore:
                     author,
                     description[:500] if description else "",
                     post_id,
+                    content_url,
+                    cover_url,
                     lifecycle,
                     priority
                 ))
@@ -244,7 +254,7 @@ class HistoryStore:
     
     def _row_to_dict(self, row: sqlite3.Row) -> dict:
         """将数据库行转换为字典"""
-        return {
+        result = {
             "id": row["id"],
             "timestamp": row["timestamp"],
             "platform": row["platform"],
@@ -258,6 +268,14 @@ class HistoryStore:
             "lifecycle": row["lifecycle"],
             "priority": row["priority"]
         }
+        # 兼容旧数据（没有 content_url 和 cover_url 字段）
+        try:
+            result["content_url"] = row["content_url"] or ""
+            result["cover_url"] = row["cover_url"] or ""
+        except (IndexError, KeyError):
+            result["content_url"] = ""
+            result["cover_url"] = ""
+        return result
     
     def get_all(
         self,

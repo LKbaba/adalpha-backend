@@ -261,12 +261,31 @@ class StreamManager:
             else:
                 author_name = str(author) if author else "unknown"
             
-            # 提取内容描述
+            # 提取内容描述和 URL
+            content = data.get("content", {})
             description = data.get("description", "")
-            if not description:
-                content = data.get("content", {})
-                if isinstance(content, dict):
-                    description = content.get("title", "")
+            content_url = ""
+            cover_url = ""
+            
+            # 优先从顶层字段获取 (Kafka 发送的标准格式)
+            content_url = data.get("content_url", "")
+            cover_url = data.get("cover_url", "")
+            
+            # 如果顶层没有，从 content 对象获取
+            if not content_url and isinstance(content, dict):
+                content_url = content.get("url", "")
+            if not cover_url and isinstance(content, dict):
+                cover_url = content.get("coverUrl", "") or content.get("thumbnailUrl", "") or content.get("mediaUrl", "")
+            
+            # 最后尝试其他字段
+            if not content_url:
+                content_url = data.get("url", "") or data.get("link", "") or data.get("share_url", "")
+            if not cover_url:
+                cover_url = data.get("coverUrl", "") or data.get("thumbnail", "") or data.get("image", "") or data.get("cover", "")
+            
+            # 提取描述
+            if not description and isinstance(content, dict):
+                description = content.get("title", "")
             
             # 提取帖子 ID
             post_id = data.get("post_id") or data.get("id") or "unknown"
@@ -322,6 +341,8 @@ class StreamManager:
                 "post_id": post_id,
                 "author": author_name,
                 "description": description[:200] if description else "",
+                "content_url": content_url,
+                "cover_url": cover_url,
                 "timestamp": datetime.utcnow().isoformat(),
                 "source": "adaptive_trend_scorer",
                 # 6 维度分数
@@ -359,10 +380,12 @@ class StreamManager:
                     author=author_name,
                     description=description[:200] if description else "",
                     post_id=post_id,
+                    content_url=content_url,
+                    cover_url=cover_url,
                     lifecycle=score_result.get("lifecycle", "unknown"),
                     priority=score_result.get("priority", "P3")
                 )
-                logger.info(f"📦 Stored to history: {platform}/{hashtag} score={score_result.get('trend_score', 0)}")
+                logger.info(f"📦 Stored to history: {platform}/{hashtag} score={score_result.get('trend_score', 0)} url={content_url[:50] if content_url else 'N/A'}")
             except Exception as e:
                 logger.warning(f"Failed to store history: {e}")
             
