@@ -44,6 +44,8 @@ class HistoryStore:
         self._retention_hours = retention_hours
         self._lock = threading.Lock()
         self._record_count = 0
+        self._last_vacuum_time = datetime.utcnow()
+        self._vacuum_interval_hours = 24  # 每24小时自动 VACUUM 一次
         
         # 确保数据目录存在
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
@@ -200,6 +202,8 @@ class HistoryStore:
             # 定期清理（每100条记录清理一次）
             if self._record_count % 100 == 0:
                 self._cleanup_expired()
+                # 检查是否需要定期 VACUUM
+                self._check_periodic_vacuum()
                 
             return record
     
@@ -217,6 +221,26 @@ class HistoryStore:
                 cursor.execute("DELETE FROM score_records WHERE timestamp < ?", (cutoff_str,))
                 conn.commit()
                 logger.info(f"Cleaned {count_before} expired records")
+                
+                # 删除超过1000条记录时，执行 VACUUM 释放磁盘空间
+                if count_before >= 1000:
+                    self._vacuum_db()
+    
+    def _vacuum_db(self):
+        """执行 VACUUM 释放磁盘空间"""
+        try:
+            with self._get_connection() as conn:
+                conn.execute("VACUUM")
+                self._last_vacuum_time = datetime.utcnow()
+                logger.info("Database vacuumed, disk space reclaimed")
+        except Exception as e:
+            logger.warning(f"Failed to vacuum database: {e}")
+    
+    def _check_periodic_vacuum(self):
+        """检查是否需要定期 VACUUM"""
+        hours_since_vacuum = (datetime.utcnow() - self._last_vacuum_time).total_seconds() / 3600
+        if hours_since_vacuum >= self._vacuum_interval_hours:
+            self._vacuum_db()
     
     def _row_to_dict(self, row: sqlite3.Row) -> dict:
         """将数据库行转换为字典"""
@@ -485,6 +509,45 @@ class HistoryStore:
             conn.commit()
             self._record_count = 0
             logger.warning("All records cleared from database")
+        # 清空后立即释放空间
+        self._vacuum_db()
+    
+    def vacuum(self):
+        """手动触发 VACUUM 释放磁盘空间"""
+        self._vacuum_db()
+        return self.get_db_size()
+    
+    def get_db_size(self) -> dict:
+        """获取数据库文件大小信息"""
+        try:
+            file_size = os.path.getsize(self._db_path)
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("PRAGMA page_count")
+                page_count = cursor.fetchone()[0]
+                cursor.execute("PRAGMA freelist_count")
+                free_pages = cursor.fetchone()[0]
+                cursor.execute("PRAGMA page_size")
+                page_size = cursor.fetchone()[0]
+            
+            return {
+                "file_size_bytes": file_size,
+                "file_size_mb": round(file_size / 1024 / 1024, 2),
+                "page_count": page_count,
+                "free_pages": free_pages,
+                "used_pages": page_count - free_pages,
+                "page_size": page_size,
+                "fragmentation_percent": round(free_pages / max(page_count, 1) * 100, 2)
+            }
+        except Exception as e:
+            logger.error(f"Failed to get db size: {e}")
+            return {"error": str(e)}
+    
+    def maintenance(self):
+        """执行数据库维护：清理过期数据 + VACUUM"""
+        self._cleanup_expired()
+        self._vacuum_db()
+        return self.get_db_size()
 
 
 # 全局单例
