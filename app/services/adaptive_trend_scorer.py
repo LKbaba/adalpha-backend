@@ -482,17 +482,42 @@ class AdaptiveTrendScorer:
         return clamp(V)
     
     def compute_density(self, metrics: Dict[str, Any]) -> float:
-        """计算密度 (D)"""
+        """
+        计算密度 (D) - 包含新鲜度因子
+        
+        D 维度现在由三部分组成：
+        1. 帖子数量 (posts_norm) - 30%
+        2. 创作者多样性 (creators_norm) - 20%
+        3. 新鲜度 (freshness_rate) - 50% (最重要！)
+        
+        新鲜度逻辑：
+        - 每次爬取 tag 最新 20 条内容
+        - 如果大部分是新内容 → tag 很活跃 → D 高
+        - 如果大部分是重复内容 → tag 不活跃 → D 低
+        """
         posts = float(metrics.get("posts", 0) or 0)
         unique_creators = float(metrics.get("unique_creators", 0) or 0)
+        freshness_rate = float(metrics.get("freshness_rate", 0.5))  # 默认 0.5
         
+        # 帖子数量归一化
         posts_norm = log_normalize(posts, max_value=10000)
         
+        # 创作者多样性归一化
         if unique_creators > 0:
             creators_norm = log_normalize(unique_creators, max_value=1000)
-            D = 0.6 * posts_norm + 0.4 * creators_norm
         else:
-            D = posts_norm
+            creators_norm = posts_norm * 0.5  # 没有创作者数据时，用帖子数估算
+        
+        # 新鲜度直接使用 (已经是 0-1 范围)
+        # 但需要调整：首次爬取 freshness=1.0 不应该给满分
+        # 因为首次爬取没有历史对比，应该给中性值
+        if metrics.get("is_first_crawl", False):
+            freshness_norm = 0.5  # 首次爬取给中性值
+        else:
+            freshness_norm = freshness_rate
+        
+        # 加权组合：新鲜度占 50%，帖子数占 30%，创作者占 20%
+        D = 0.50 * freshness_norm + 0.30 * posts_norm + 0.20 * creators_norm
         
         return clamp(D)
     
@@ -632,7 +657,10 @@ class AdaptiveTrendScorer:
         platform_str: str,
         raw_stats: Dict[str, Any],
         prev_raw_stats: Optional[Dict[str, Any]] = None,
-        posts: int = 0
+        posts: int = 0,
+        freshness_rate: float = 0.5,
+        new_posts: int = 0,
+        activity_level: str = "unknown"
     ) -> Dict[str, Any]:
         """
         计算完整的 Trend Score - 自适应版本
@@ -643,6 +671,9 @@ class AdaptiveTrendScorer:
             raw_stats: 原始统计数据 (直接从爬虫获取)
             prev_raw_stats: 上一周期原始统计数据
             posts: 帖子数量
+            freshness_rate: 新鲜度 (0-1)，新内容占比
+            new_posts: 新增帖子数
+            activity_level: 活跃度等级 (very_active/active/moderate/stale)
         
         Returns:
             完整的评分结果
@@ -653,6 +684,14 @@ class AdaptiveTrendScorer:
         # 提取标准化指标
         metrics = self.extract_metrics(raw_stats, platform)
         metrics["posts"] = posts
+        metrics["freshness_rate"] = freshness_rate
+        metrics["new_posts"] = new_posts
+        
+        # 判断是否首次爬取（没有历史数据）
+        is_first_crawl = prev_raw_stats is None or all(
+            prev_raw_stats.get(k, 0) == 0 for k in ["views", "likes", "comments"]
+        )
+        metrics["is_first_crawl"] = is_first_crawl
         
         prev_metrics = None
         if prev_raw_stats:
@@ -661,7 +700,7 @@ class AdaptiveTrendScorer:
         # 计算各维度
         H = self.compute_hotness(metrics, platform)
         V = self.compute_velocity(metrics, prev_metrics, platform)
-        D = self.compute_density(metrics)
+        D = self.compute_density(metrics)  # 现在包含新鲜度
         F = self.compute_feasibility(keyword)
         M = self.compute_monetization(keyword, metrics, platform)
         R = self.compute_risk(keyword, metrics, platform)
@@ -711,6 +750,13 @@ class AdaptiveTrendScorer:
                 "shares": metrics.get("shares", 0),
                 "saves": metrics.get("saves", 0),
                 "posts": posts,
+            },
+            # 新增：活跃度指标
+            "activity": {
+                "freshness_rate": freshness_rate,
+                "new_posts": new_posts,
+                "activity_level": activity_level,
+                "is_first_crawl": is_first_crawl,
             },
             "computed_at": datetime.utcnow().isoformat()
         }
@@ -944,11 +990,21 @@ def compute_adaptive_trend_score(
     platform_str: str,
     raw_stats: Dict[str, Any],
     prev_raw_stats: Optional[Dict[str, Any]] = None,
-    posts: int = 0
+    posts: int = 0,
+    freshness_rate: float = 0.5,
+    new_posts: int = 0,
+    activity_level: str = "unknown"
 ) -> Dict[str, Any]:
     """便捷函数，使用全局单例计算"""
     return adaptive_trend_scorer.compute_trend_score(
-        keyword, platform_str, raw_stats, prev_raw_stats, posts
+        keyword=keyword,
+        platform_str=platform_str,
+        raw_stats=raw_stats,
+        prev_raw_stats=prev_raw_stats,
+        posts=posts,
+        freshness_rate=freshness_rate,
+        new_posts=new_posts,
+        activity_level=activity_level
     )
 
 

@@ -10,6 +10,7 @@ from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field
 
 from app.services.history_store import history_store
+from app.services.smart_history_store import smart_history_store
 
 logger = logging.getLogger(__name__)
 
@@ -177,3 +178,104 @@ async def get_time_series(
         interval_seconds=interval
     )
     return data
+
+
+# === Smart History Endpoints (新版智能存储) ===
+
+class TagScoreResponse(BaseModel):
+    """Tag 分数响应"""
+    platform: str
+    tag: str
+    trend_score: float
+    dimensions: dict
+    lifecycle: str
+    priority: str
+    post_count: int
+    stats: dict
+    last_updated_at: str
+
+
+class PostResponse(BaseModel):
+    """帖子响应"""
+    post_id: str
+    platform: str
+    tag: str
+    author: str
+    description: str
+    content_url: str
+    cover_url: str
+    stats: dict
+    prev_stats: dict
+    update_count: int
+    first_seen_at: str
+    last_updated_at: str
+
+
+class SmartStatsResponse(BaseModel):
+    """智能存储统计响应"""
+    total_posts: int
+    total_tags: int
+    platforms: int
+    avg_score: float
+
+
+@router.get("/smart/tags", response_model=List[TagScoreResponse])
+async def get_smart_tag_scores(
+    platform: Optional[str] = Query(default=None, description="平台过滤"),
+    limit: int = Query(default=50, ge=1, le=200, description="返回数量"),
+    min_score: float = Query(default=0, ge=0, le=100, description="最低分数")
+):
+    """
+    获取 Tag 聚合分数排名（智能版）
+    
+    返回去重后的 tag 聚合分数，包含增长率计算。
+    """
+    scores = smart_history_store.get_tag_scores(
+        platform=platform,
+        limit=limit,
+        min_score=min_score
+    )
+    return scores
+
+
+@router.get("/smart/tags/{platform}/{tag}/posts", response_model=List[PostResponse])
+async def get_tag_posts(
+    platform: str,
+    tag: str,
+    limit: int = Query(default=30, ge=1, le=100, description="返回数量")
+):
+    """
+    获取某个 Tag 下的帖子列表
+    
+    返回该 tag 下的所有帖子，包含历史数据对比。
+    """
+    posts = smart_history_store.get_posts_by_tag(
+        platform=platform,
+        tag=tag,
+        limit=limit
+    )
+    return posts
+
+
+@router.get("/smart/stats", response_model=SmartStatsResponse)
+async def get_smart_stats():
+    """
+    获取智能存储统计
+    
+    返回帖子数、tag 数、平台数等统计信息。
+    """
+    stats = smart_history_store.get_stats()
+    return SmartStatsResponse(**stats)
+
+
+@router.post("/smart/cleanup")
+async def cleanup_smart_history():
+    """
+    手动触发清理过期数据
+    """
+    smart_history_store.cleanup_expired()
+    stats = smart_history_store.get_stats()
+    return {
+        "message": "Cleanup completed",
+        "stats": stats
+    }

@@ -25,6 +25,7 @@ from app.config import get_settings
 from app.services.kafka_client import kafka_client
 from app.services.adaptive_trend_scorer import adaptive_trend_scorer
 from app.services.history_store import history_store
+from app.services.smart_history_store import smart_history_store
 
 logger = logging.getLogger(__name__)
 
@@ -369,25 +370,109 @@ class StreamManager:
                 })
             }
             
-            # 存储到历史记录
+            # 智能存储：去重 + 更新 + 聚合计算
             try:
-                history_store.add_record(
+                # 1. 存储/更新帖子数据（自动去重）
+                is_new, prev_stats = smart_history_store.upsert_post(
                     platform=platform,
-                    hashtag=hashtag,
-                    trend_score=score_result.get("trend_score", 0),
-                    dimensions=result["dimensions"],
-                    raw_data=data,
+                    tag=hashtag.lstrip("#"),
+                    post_id=post_id,
+                    stats=crawl_item["stats"],
                     author=author_name,
                     description=description[:200] if description else "",
-                    post_id=post_id,
                     content_url=content_url,
                     cover_url=cover_url,
-                    lifecycle=score_result.get("lifecycle", "unknown"),
-                    priority=score_result.get("priority", "P3")
+                    post_created_at=data.get("created_at", "")
                 )
-                logger.info(f"📦 Stored to history: {platform}/{hashtag} score={score_result.get('trend_score', 0)} url={content_url[:50] if content_url else 'N/A'}")
+                
+                # 2. 获取该 tag 的聚合数据（包含新鲜度）
+                aggregated = smart_history_store.get_tag_aggregated_stats(
+                    platform, hashtag, 
+                    current_batch_size=20  # 每次爬取约 20 条
+                )
+                
+                # 3. 使用聚合数据重新计算 Trend Score（带增长率 + 新鲜度）
+                from app.services.adaptive_trend_scorer import compute_adaptive_trend_score
+                aggregated_score = compute_adaptive_trend_score(
+                    keyword=hashtag.lstrip("#"),
+                    platform_str=platform,
+                    raw_stats=aggregated["current"],
+                    prev_raw_stats=aggregated["previous"] if aggregated["previous"]["views"] > 0 else None,
+                    posts=aggregated["post_count"],
+                    freshness_rate=aggregated.get("freshness_rate", 0.5),
+                    new_posts=aggregated.get("new_posts", 0),
+                    activity_level=aggregated.get("activity_level", "unknown")
+                )
+                
+                # 4. 保存 tag 聚合分数
+                smart_history_store.save_tag_score(
+                    platform=platform,
+                    tag=hashtag,
+                    aggregated_stats=aggregated,
+                    trend_score=aggregated_score["trend_score"],
+                    dimensions={
+                        "H": aggregated_score["H"],
+                        "V": aggregated_score["V"],
+                        "D": aggregated_score["D"],
+                        "F": aggregated_score["F"],
+                        "M": aggregated_score["M"],
+                        "R": aggregated_score["R"]
+                    },
+                    lifecycle=aggregated_score["lifecycle"],
+                    priority=aggregated_score["priority"]
+                )
+                
+                # 更新返回结果为聚合分数
+                result["trend_score"] = aggregated_score["trend_score"]
+                result["vks_score"] = aggregated_score["trend_score"]
+                result["dimensions"] = {
+                    "H": aggregated_score["H"],
+                    "V": aggregated_score["V"],
+                    "D": aggregated_score["D"],
+                    "F": aggregated_score["F"],
+                    "M": aggregated_score["M"],
+                    "R": aggregated_score["R"]
+                }
+                result["lifecycle"] = aggregated_score["lifecycle"]
+                result["priority"] = aggregated_score["priority"]
+                result["is_new_post"] = is_new
+                result["post_count"] = aggregated["post_count"]
+                result["new_posts_count"] = aggregated["new_posts"]
+                
+                # 新增：活跃度信息
+                result["activity"] = {
+                    "freshness_rate": aggregated.get("freshness_rate", 0),
+                    "activity_level": aggregated.get("activity_level", "unknown"),
+                    "new_posts": aggregated.get("new_posts", 0),
+                }
+                
+                status = "NEW" if is_new else "UPDATED"
+                freshness = aggregated.get("freshness_rate", 0)
+                activity = aggregated.get("activity_level", "?")
+                logger.info(f"📦 [{status}] {platform}/{hashtag}: posts={aggregated['post_count']}, "
+                           f"score={aggregated_score['trend_score']}, V={aggregated_score['V']:.2f}, "
+                           f"D={aggregated_score['D']:.2f}, freshness={freshness:.0%} ({activity})")
+                
             except Exception as e:
-                logger.warning(f"Failed to store history: {e}")
+                logger.warning(f"Failed to smart store: {e}", exc_info=True)
+                # 回退到旧存储
+                try:
+                    history_store.add_record(
+                        platform=platform,
+                        hashtag=hashtag,
+                        trend_score=score_result.get("trend_score", 0),
+                        dimensions=result["dimensions"],
+                        raw_data=data,
+                        author=author_name,
+                        description=description[:200] if description else "",
+                        post_id=post_id,
+                        content_url=content_url,
+                        cover_url=cover_url,
+                        lifecycle=score_result.get("lifecycle", "unknown"),
+                        priority=score_result.get("priority", "P3")
+                    )
+                except Exception as e2:
+                    logger.warning(f"Fallback store also failed: {e2}")
             
             return result
         except Exception as e:
