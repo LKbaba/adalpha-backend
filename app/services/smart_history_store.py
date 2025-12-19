@@ -67,6 +67,7 @@ class SmartHistoryStore:
                     tag TEXT NOT NULL,
                     post_id TEXT NOT NULL,
                     author TEXT DEFAULT '',
+                    title TEXT DEFAULT '',
                     description TEXT DEFAULT '',
                     content_url TEXT DEFAULT '',
                     cover_url TEXT DEFAULT '',
@@ -84,6 +85,12 @@ class SmartHistoryStore:
                     prev_comments INTEGER DEFAULT 0,
                     prev_shares INTEGER DEFAULT 0,
                     prev_saves INTEGER DEFAULT 0,
+                    
+                    -- 趋势分数
+                    trend_score REAL DEFAULT 0,
+                    dimensions TEXT DEFAULT '{}',
+                    lifecycle TEXT DEFAULT 'unknown',
+                    priority TEXT DEFAULT 'P3',
                     
                     -- 时间戳
                     first_seen_at TEXT NOT NULL,
@@ -154,10 +161,15 @@ class SmartHistoryStore:
         post_id: str,
         stats: Dict[str, int],
         author: str = "",
+        title: str = "",
         description: str = "",
         content_url: str = "",
         cover_url: str = "",
-        post_created_at: str = ""
+        post_created_at: str = "",
+        trend_score: float = 0,
+        dimensions: Optional[Dict[str, float]] = None,
+        lifecycle: str = "unknown",
+        priority: str = "P3"
     ) -> Tuple[bool, Optional[Dict[str, int]]]:
         """
         插入或更新帖子数据
@@ -200,9 +212,14 @@ class SmartHistoryStore:
                             views = ?, likes = ?, comments = ?, shares = ?, saves = ?,
                             prev_views = ?, prev_likes = ?, prev_comments = ?, prev_shares = ?, prev_saves = ?,
                             author = COALESCE(NULLIF(?, ''), author),
+                            title = COALESCE(NULLIF(?, ''), title),
                             description = COALESCE(NULLIF(?, ''), description),
                             content_url = COALESCE(NULLIF(?, ''), content_url),
                             cover_url = COALESCE(NULLIF(?, ''), cover_url),
+                            trend_score = ?,
+                            dimensions = ?,
+                            lifecycle = ?,
+                            priority = ?,
                             last_updated_at = ?,
                             update_count = update_count + 1
                         WHERE id = ?
@@ -210,7 +227,8 @@ class SmartHistoryStore:
                         views, likes, comments, shares, saves,
                         prev_stats["views"], prev_stats["likes"], prev_stats["comments"], 
                         prev_stats["shares"], prev_stats["saves"],
-                        author, description, content_url, cover_url,
+                        author, title, description, content_url, cover_url,
+                        trend_score, json.dumps(dimensions or {}), lifecycle, priority,
                         now, unique_id
                     ))
                     conn.commit()
@@ -221,15 +239,18 @@ class SmartHistoryStore:
                     # 插入新记录
                     cursor.execute("""
                         INSERT INTO posts 
-                        (id, platform, tag, post_id, author, description, content_url, cover_url,
+                        (id, platform, tag, post_id, author, title, description, content_url, cover_url,
                          views, likes, comments, shares, saves,
                          prev_views, prev_likes, prev_comments, prev_shares, prev_saves,
+                         trend_score, dimensions, lifecycle, priority,
                          first_seen_at, last_updated_at, post_created_at, update_count)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, ?, ?, ?, 1)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, ?, ?, ?, ?, ?, ?, ?, 1)
                     """, (
                         unique_id, platform.lower(), tag.lower().lstrip("#"), post_id,
-                        author, description[:500], content_url, cover_url,
+                        author, title[:200] if title else "", description[:500] if description else "", 
+                        content_url, cover_url,
                         views, likes, comments, shares, saves,
+                        trend_score, json.dumps(dimensions or {}), lifecycle, priority,
                         now, now, post_created_at
                     ))
                     conn.commit()
@@ -510,6 +531,7 @@ class SmartHistoryStore:
                     "platform": row["platform"],
                     "tag": row["tag"],
                     "author": row["author"],
+                    "title": row["title"] if "title" in row.keys() else "",
                     "description": row["description"],
                     "content_url": row["content_url"],
                     "cover_url": row["cover_url"],
@@ -533,6 +555,103 @@ class SmartHistoryStore:
                 })
             
             return results
+    
+    def get_posts_ranking(
+        self,
+        platform: Optional[str] = None,
+        limit: int = 50,
+        min_score: float = 0
+    ) -> List[Dict[str, Any]]:
+        """
+        获取帖子排名（按 trend_score 降序）
+        
+        Args:
+            platform: 平台过滤（可选）
+            limit: 返回数量
+            min_score: 最低分数
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            
+            if platform:
+                cursor.execute("""
+                    SELECT * FROM posts 
+                    WHERE platform = ? AND trend_score >= ?
+                    ORDER BY trend_score DESC
+                    LIMIT ?
+                """, (platform.lower(), min_score, limit))
+            else:
+                cursor.execute("""
+                    SELECT * FROM posts 
+                    WHERE trend_score >= ?
+                    ORDER BY trend_score DESC
+                    LIMIT ?
+                """, (min_score, limit))
+            
+            results = []
+            for row in cursor.fetchall():
+                # 安全获取可能不存在的列
+                dims = {}
+                try:
+                    dims = json.loads(row["dimensions"]) if row["dimensions"] else {}
+                except:
+                    pass
+                
+                results.append({
+                    "id": row["id"],
+                    "platform": row["platform"],
+                    "tag": row["tag"],
+                    "post_id": row["post_id"],
+                    "author": row["author"],
+                    "title": row["title"] if "title" in row.keys() else "",
+                    "description": row["description"],
+                    "content_url": row["content_url"],
+                    "cover_url": row["cover_url"],
+                    "trend_score": row["trend_score"] if "trend_score" in row.keys() else 0,
+                    "dimensions": dims,
+                    "lifecycle": row["lifecycle"] if "lifecycle" in row.keys() else "unknown",
+                    "priority": row["priority"] if "priority" in row.keys() else "P3",
+                    "stats": {
+                        "views": row["views"],
+                        "likes": row["likes"],
+                        "comments": row["comments"],
+                        "shares": row["shares"],
+                        "saves": row["saves"]
+                    },
+                    "update_count": row["update_count"],
+                    "last_updated_at": row["last_updated_at"]
+                })
+            
+            return results
+
+    def get_top_post_for_tag(
+        self,
+        platform: str,
+        tag: str
+    ) -> Optional[Dict[str, Any]]:
+        """获取某个 tag 下最热门的帖子（用于展示代表信息）"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                SELECT author, title, description, content_url, cover_url, views
+                FROM posts
+                WHERE platform = ? AND tag = ?
+                ORDER BY views DESC
+                LIMIT 1
+            """, (platform.lower(), tag.lower().lstrip("#")))
+            
+            row = cursor.fetchone()
+            if row:
+                return {
+                    "author": row["author"],
+                    "title": row["title"] if "title" in row.keys() else "",
+                    "description": row["description"],
+                    "content_url": row["content_url"],
+                    "cover_url": row["cover_url"],
+                    "views": row["views"]
+                }
+            return None
     
     def cleanup_expired(self):
         """清理过期数据"""
@@ -588,6 +707,17 @@ class SmartHistoryStore:
                 "platforms": platforms,
                 "avg_score": round(avg_score, 2)
             }
+    
+    def clear_all(self):
+        """清空所有数据（谨慎使用）"""
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM posts")
+                cursor.execute("DELETE FROM tag_scores")
+                conn.commit()
+                conn.execute("VACUUM")
+                logger.warning("All smart history data cleared")
 
 
 # 全局单例

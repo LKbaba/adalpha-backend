@@ -133,6 +133,7 @@ class HistoryStore:
         dimensions: Dict[str, float],
         raw_data: Dict[str, Any],
         author: str = "",
+        title: str = "",
         description: str = "",
         post_id: str = "",
         content_url: str = "",
@@ -141,7 +142,7 @@ class HistoryStore:
         priority: str = "P3"
     ) -> dict:
         """
-        添加一条得分记录
+        添加或更新一条得分记录（基于 platform + post_id 去重）
         
         Args:
             platform: 平台名称
@@ -150,30 +151,113 @@ class HistoryStore:
             dimensions: 6维度分数 {H, V, D, F, M, R}
             raw_data: 原始爬虫数据
             author: 作者
+            title: 帖子标题
             description: 内容描述
-            post_id: 帖子ID
+            post_id: 帖子ID（用于去重）
             content_url: 内容链接
             cover_url: 封面图链接
             lifecycle: 生命周期阶段
             priority: 优先级
             
         Returns:
-            dict: 创建的记录
+            dict: 创建或更新的记录
         """
         with self._lock:
-            self._record_count += 1
             now = datetime.utcnow()
-            record_id = f"{platform}-{self._record_count}-{now.strftime('%H%M%S%f')}"
+            platform_upper = platform.upper()
+            
+            # 如果有 post_id，检查是否已存在
+            existing_id = None
+            if post_id and post_id != "unknown":
+                with self._get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "SELECT id FROM score_records WHERE platform = ? AND post_id = ?",
+                        (platform_upper, post_id)
+                    )
+                    row = cursor.fetchone()
+                    if row:
+                        existing_id = row[0]
+            
+            if existing_id:
+                # 更新已有记录
+                record_id = existing_id
+                with self._get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        UPDATE score_records SET
+                            timestamp = ?,
+                            hashtag = ?,
+                            trend_score = ?,
+                            dimensions = ?,
+                            raw_data = ?,
+                            author = ?,
+                            title = ?,
+                            description = ?,
+                            content_url = ?,
+                            cover_url = ?,
+                            lifecycle = ?,
+                            priority = ?
+                        WHERE id = ?
+                    """, (
+                        now.isoformat(),
+                        hashtag,
+                        trend_score,
+                        json.dumps(dimensions),
+                        json.dumps(raw_data),
+                        author,
+                        title[:200] if title else "",
+                        description[:500] if description else "",
+                        content_url,
+                        cover_url,
+                        lifecycle,
+                        priority,
+                        existing_id
+                    ))
+                    conn.commit()
+                logger.debug(f"Updated record: {record_id}, platform={platform}, score={trend_score}")
+            else:
+                # 插入新记录
+                self._record_count += 1
+                record_id = f"{platform_upper}-{self._record_count}-{now.strftime('%H%M%S%f')}"
+                
+                with self._get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        INSERT INTO score_records 
+                        (id, timestamp, platform, hashtag, trend_score, dimensions, 
+                         raw_data, author, title, description, post_id, content_url, cover_url, lifecycle, priority)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        record_id,
+                        now.isoformat(),
+                        platform_upper,
+                        hashtag,
+                        trend_score,
+                        json.dumps(dimensions),
+                        json.dumps(raw_data),
+                        author,
+                        title[:200] if title else "",
+                        description[:500] if description else "",
+                        post_id,
+                        content_url,
+                        cover_url,
+                        lifecycle,
+                        priority
+                    ))
+                    conn.commit()
+                logger.debug(f"Added record: {record_id}, platform={platform}, score={trend_score}")
             
             record = {
                 "id": record_id,
                 "timestamp": now.isoformat(),
-                "platform": platform.upper(),
+                "platform": platform_upper,
                 "hashtag": hashtag,
                 "trend_score": trend_score,
                 "dimensions": dimensions,
                 "raw_data": raw_data,
                 "author": author,
+                "title": title[:200] if title else "",
                 "description": description[:500] if description else "",
                 "post_id": post_id,
                 "content_url": content_url,
@@ -181,33 +265,6 @@ class HistoryStore:
                 "lifecycle": lifecycle,
                 "priority": priority
             }
-            
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    INSERT INTO score_records 
-                    (id, timestamp, platform, hashtag, trend_score, dimensions, 
-                     raw_data, author, description, post_id, content_url, cover_url, lifecycle, priority)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    record_id,
-                    now.isoformat(),
-                    platform.upper(),
-                    hashtag,
-                    trend_score,
-                    json.dumps(dimensions),
-                    json.dumps(raw_data),
-                    author,
-                    description[:500] if description else "",
-                    post_id,
-                    content_url,
-                    cover_url,
-                    lifecycle,
-                    priority
-                ))
-                conn.commit()
-            
-            logger.debug(f"Added record: {record_id}, platform={platform}, score={trend_score}")
             
             # 定期清理（每100条记录清理一次）
             if self._record_count % 100 == 0:
@@ -268,7 +325,11 @@ class HistoryStore:
             "lifecycle": row["lifecycle"],
             "priority": row["priority"]
         }
-        # 兼容旧数据（没有 content_url 和 cover_url 字段）
+        # 兼容旧数据（没有 title, content_url 和 cover_url 字段）
+        try:
+            result["title"] = row["title"] or ""
+        except (IndexError, KeyError):
+            result["title"] = ""
         try:
             result["content_url"] = row["content_url"] or ""
             result["cover_url"] = row["cover_url"] or ""

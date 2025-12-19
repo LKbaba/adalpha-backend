@@ -1,15 +1,14 @@
 """
-History API Endpoints - 历史数据查询接口
+History API Endpoints - 历史数据查询接口 (Smart History 版本)
 
-提供历史得分数据的查询和排名功能。
+基于 SmartHistoryStore 提供历史得分数据的查询和排名功能。
 """
 
 import logging
 from typing import Optional, List
 from fastapi import APIRouter, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
-from app.services.history_store import history_store
 from app.services.smart_history_store import smart_history_store
 
 logger = logging.getLogger(__name__)
@@ -20,7 +19,7 @@ router = APIRouter(prefix="/api/history", tags=["History Data"])
 # === Response Models ===
 
 class ScoreRecordResponse(BaseModel):
-    """得分记录响应"""
+    """得分记录响应 (兼容旧格式)"""
     id: str
     timestamp: str
     platform: str
@@ -28,11 +27,17 @@ class ScoreRecordResponse(BaseModel):
     trend_score: float
     dimensions: dict
     author: str = ""
+    title: str = ""
     description: str = ""
     post_id: str = ""
+    content_url: str = ""
+    cover_url: str = ""
     lifecycle: str = "unknown"
     priority: str = "P3"
     rank: Optional[int] = None
+    # 新增字段
+    post_count: int = 0
+    activity: Optional[dict] = None
 
 
 class PlatformRankingResponse(BaseModel):
@@ -48,197 +53,148 @@ class HistoryStatsResponse(BaseModel):
     retention_hours: int
     platforms: dict
     average_scores: dict
-    oldest_record: Optional[str]
-    newest_record: Optional[str]
+    oldest_record: Optional[str] = None
+    newest_record: Optional[str] = None
 
 
-class TimeSeriesPoint(BaseModel):
-    """时间序列数据点"""
-    time: str
-    avg_score: float
-    max_score: float
-    min_score: float
-    count: int
+# === Helper Functions ===
+
+def _post_to_record(post_data: dict, rank: int) -> dict:
+    """将 post 数据转换为前端兼容格式"""
+    return {
+        "id": post_data["id"],
+        "timestamp": post_data.get("last_updated_at", ""),
+        "platform": post_data["platform"].upper(),
+        "hashtag": f"#{post_data['tag']}",
+        "trend_score": post_data.get("trend_score", 0),
+        "dimensions": post_data.get("dimensions", {}),
+        "author": post_data.get("author", ""),
+        "title": post_data.get("title") or post_data.get("description", "")[:100] or f"#{post_data['tag']}",
+        "description": post_data.get("description", ""),
+        "post_id": post_data["post_id"],
+        "content_url": post_data.get("content_url", ""),
+        "cover_url": post_data.get("cover_url", ""),
+        "lifecycle": post_data.get("lifecycle", "unknown"),
+        "priority": post_data.get("priority", "P3"),
+        "rank": rank,
+        "stats": post_data.get("stats", {}),
+    }
 
 
-# === Endpoints ===
-
-@router.get("/all", response_model=List[ScoreRecordResponse])
-async def get_all_history(
-    limit: int = Query(default=100, ge=1, le=500, description="返回数量限制"),
-    offset: int = Query(default=0, ge=0, description="偏移量"),
-    sort_by_score: bool = Query(default=True, description="是否按分数排序")
-):
-    """
-    获取所有历史记录
-    
-    返回过去2小时内的所有得分记录，支持分页和排序。
-    """
-    records = history_store.get_all(limit=limit, offset=offset, sort_by_score=sort_by_score)
-    return records
-
-
-@router.get("/platform/{platform}", response_model=List[ScoreRecordResponse])
-async def get_platform_history(
-    platform: str,
-    limit: int = Query(default=50, ge=1, le=200, description="返回数量限制"),
-    sort_by_score: bool = Query(default=True, description="是否按分数排序")
-):
-    """
-    获取指定平台的历史记录
-    
-    返回指定平台过去2小时内的得分记录，带排名。
-    
-    支持的平台: TIKTOK, INSTAGRAM, TWITTER, YOUTUBE, REDDIT, LINKEDIN, FACEBOOK
-    """
-    records = history_store.get_by_platform(
-        platform=platform,
-        limit=limit,
-        sort_by_score=sort_by_score
-    )
-    return records
-
+# === Main Endpoints (使用 Smart History) ===
 
 @router.get("/rankings")
 async def get_all_rankings(
-    top_n: int = Query(default=20, ge=1, le=100, description="每个平台返回的数量")
+    top_n: int = Query(default=100, ge=1, le=500, description="每个平台返回的数量")
 ):
     """
     获取各平台排名
     
     返回所有平台的 Top N 排名数据，按 trend_score 降序排列。
     """
-    rankings = history_store.get_rankings(top_n=top_n)
+    # 获取所有帖子（按分数排序）
+    all_posts = smart_history_store.get_posts_ranking(limit=2000)
     
-    result = {}
-    for platform, records in rankings.items():
-        result[platform] = {
-            "platform": platform,
-            "records": records,
-            "total": len(records)
-        }
+    # 按平台分组
+    rankings = {}
+    for post in all_posts:
+        platform = post["platform"].upper()
+        if platform not in rankings:
+            rankings[platform] = {
+                "platform": platform,
+                "records": [],
+                "total": 0
+            }
+        
+        if len(rankings[platform]["records"]) < top_n:
+            rank = len(rankings[platform]["records"]) + 1
+            record = _post_to_record(post, rank)
+            rankings[platform]["records"].append(record)
+            rankings[platform]["total"] = len(rankings[platform]["records"])
     
-    return result
+    return rankings
 
 
-@router.get("/stats", response_model=HistoryStatsResponse)
+@router.get("/platform/{platform}")
+async def get_platform_history(
+    platform: str,
+    limit: int = Query(default=50, ge=1, le=200, description="返回数量限制")
+):
+    """
+    获取指定平台的历史记录
+    """
+    posts = smart_history_store.get_posts_ranking(
+        platform=platform.lower(),
+        limit=limit
+    )
+    
+    records = []
+    for rank, post in enumerate(posts, 1):
+        records.append(_post_to_record(post, rank))
+    
+    return records
+
+
+@router.get("/stats")
 async def get_history_stats():
     """
     获取历史数据统计
-    
-    返回存储的统计信息，包括各平台记录数和平均分。
     """
-    stats = history_store.get_stats()
-    return HistoryStatsResponse(**stats)
+    stats = smart_history_store.get_stats()
+    
+    # 获取平台分布（从帖子表）
+    all_posts = smart_history_store.get_posts_ranking(limit=1000)
+    platforms = {}
+    avg_scores = {}
+    
+    for post in all_posts:
+        platform = post["platform"].upper()
+        if platform not in platforms:
+            platforms[platform] = 0
+            avg_scores[platform] = []
+        platforms[platform] += 1
+        avg_scores[platform].append(post.get("trend_score", 0))
+    
+    # 计算平均分
+    for platform in avg_scores:
+        scores_list = avg_scores[platform]
+        avg_scores[platform] = round(sum(scores_list) / len(scores_list), 2) if scores_list else 0
+    
+    return {
+        "total_records": stats["total_posts"],
+        "retention_hours": 2,
+        "platforms": platforms,
+        "average_scores": avg_scores,
+        "oldest_record": None,
+        "newest_record": None,
+    }
 
 
 @router.get("/crawl-summary")
 async def get_crawl_summary():
     """
     获取爬取摘要
-    
-    返回爬取次数、数据量等统计信息。
     """
-    stats = history_store.get_stats()
+    stats = smart_history_store.get_stats()
     
-    # 从 crawl API 获取爬取次数
     from app.api.crawl import crawl_state
     
     return {
-        "total_records": stats["total_records"],
-        "platforms": stats["platforms"],
-        "average_scores": stats["average_scores"],
-        "retention_hours": stats["retention_hours"],
+        "total_records": stats["total_tags"],
+        "total_posts": stats["total_posts"],
+        "platforms_count": stats["platforms"],
+        "avg_score": stats["avg_score"],
         "crawl_info": {
             "last_run": crawl_state.last_run.isoformat() if crawl_state.last_run else None,
             "is_running": crawl_state.is_running,
             "last_result": crawl_state.last_result,
         },
-        "time_range": {
-            "oldest": stats["oldest_record"],
-            "newest": stats["newest_record"],
-        }
     }
 
 
-@router.get("/timeseries", response_model=List[TimeSeriesPoint])
-async def get_time_series(
-    platform: Optional[str] = Query(default=None, description="平台过滤（可选）"),
-    minutes: int = Query(default=30, ge=5, le=120, description="时间范围（分钟）"),
-    interval: int = Query(default=60, ge=10, le=300, description="聚合间隔（秒）")
-):
-    """
-    获取时间序列数据
-    
-    返回聚合后的时间序列数据，用于图表展示。
-    """
-    data = history_store.get_time_series(
-        platform=platform,
-        minutes=minutes,
-        interval_seconds=interval
-    )
-    return data
+# === Tag Detail Endpoints ===
 
-
-# === Smart History Endpoints (新版智能存储) ===
-
-class TagScoreResponse(BaseModel):
-    """Tag 分数响应"""
-    platform: str
-    tag: str
-    trend_score: float
-    dimensions: dict
-    lifecycle: str
-    priority: str
-    post_count: int
-    stats: dict
-    last_updated_at: str
-
-
-class PostResponse(BaseModel):
-    """帖子响应"""
-    post_id: str
-    platform: str
-    tag: str
-    author: str
-    description: str
-    content_url: str
-    cover_url: str
-    stats: dict
-    prev_stats: dict
-    update_count: int
-    first_seen_at: str
-    last_updated_at: str
-
-
-class SmartStatsResponse(BaseModel):
-    """智能存储统计响应"""
-    total_posts: int
-    total_tags: int
-    platforms: int
-    avg_score: float
-
-
-@router.get("/smart/tags", response_model=List[TagScoreResponse])
-async def get_smart_tag_scores(
-    platform: Optional[str] = Query(default=None, description="平台过滤"),
-    limit: int = Query(default=50, ge=1, le=200, description="返回数量"),
-    min_score: float = Query(default=0, ge=0, le=100, description="最低分数")
-):
-    """
-    获取 Tag 聚合分数排名（智能版）
-    
-    返回去重后的 tag 聚合分数，包含增长率计算。
-    """
-    scores = smart_history_store.get_tag_scores(
-        platform=platform,
-        limit=limit,
-        min_score=min_score
-    )
-    return scores
-
-
-@router.get("/smart/tags/{platform}/{tag}/posts", response_model=List[PostResponse])
+@router.get("/tags/{platform}/{tag}/posts")
 async def get_tag_posts(
     platform: str,
     tag: str,
@@ -246,8 +202,6 @@ async def get_tag_posts(
 ):
     """
     获取某个 Tag 下的帖子列表
-    
-    返回该 tag 下的所有帖子，包含历史数据对比。
     """
     posts = smart_history_store.get_posts_by_tag(
         platform=platform,
@@ -257,19 +211,10 @@ async def get_tag_posts(
     return posts
 
 
-@router.get("/smart/stats", response_model=SmartStatsResponse)
-async def get_smart_stats():
-    """
-    获取智能存储统计
-    
-    返回帖子数、tag 数、平台数等统计信息。
-    """
-    stats = smart_history_store.get_stats()
-    return SmartStatsResponse(**stats)
+# === Management Endpoints ===
 
-
-@router.post("/smart/cleanup")
-async def cleanup_smart_history():
+@router.post("/cleanup")
+async def cleanup_history():
     """
     手动触发清理过期数据
     """
@@ -278,4 +223,16 @@ async def cleanup_smart_history():
     return {
         "message": "Cleanup completed",
         "stats": stats
+    }
+
+
+@router.delete("/clear")
+async def clear_all_history():
+    """
+    清空所有历史数据（谨慎使用）
+    """
+    smart_history_store.clear_all()
+    return {
+        "message": "All history data cleared",
+        "stats": smart_history_store.get_stats()
     }

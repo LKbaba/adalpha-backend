@@ -24,7 +24,6 @@ from confluent_kafka import Consumer, KafkaError
 from app.config import get_settings
 from app.services.kafka_client import kafka_client
 from app.services.adaptive_trend_scorer import adaptive_trend_scorer
-from app.services.history_store import history_store
 from app.services.smart_history_store import smart_history_store
 
 logger = logging.getLogger(__name__)
@@ -262,9 +261,41 @@ class StreamManager:
             else:
                 author_name = str(author) if author else "unknown"
             
-            # 提取内容描述和 URL
+            # 提取内容对象
             content = data.get("content", {})
+            
+            # 提取标题 (title) - 各平台字段名不同
+            # TikTok: content.title
+            # YouTube: content.title 或 rawData.title
+            # Instagram: content.title 或 caption
+            # Twitter: text 或 content.text
+            # Reddit: title
+            title = ""
+            if isinstance(content, dict):
+                title = content.get("title", "")
+            if not title:
+                title = (
+                    data.get("title", "") or  # 通用
+                    data.get("text", "") or   # Twitter
+                    data.get("caption", "") or  # Instagram
+                    data.get("name", "")  # Reddit
+                )
+            # 从 rawData 中尝试获取
+            raw_data_inner = data.get("rawData", {}) or data.get("raw", {})
+            if not title and isinstance(raw_data_inner, dict):
+                title = raw_data_inner.get("title", "") or raw_data_inner.get("desc", "")
+            
+            # 提取描述 (description) - 通常是更长的文本
             description = data.get("description", "")
+            if not description and isinstance(content, dict):
+                description = content.get("description", "") or content.get("text", "")
+            if not description and isinstance(raw_data_inner, dict):
+                description = raw_data_inner.get("description", "") or raw_data_inner.get("desc", "")
+            # 如果没有 description，使用 title 作为 fallback
+            if not description:
+                description = title
+            
+            # 提取 URL
             content_url = ""
             cover_url = ""
             
@@ -283,10 +314,6 @@ class StreamManager:
                 content_url = data.get("url", "") or data.get("link", "") or data.get("share_url", "")
             if not cover_url:
                 cover_url = data.get("coverUrl", "") or data.get("thumbnail", "") or data.get("image", "") or data.get("cover", "")
-            
-            # 提取描述
-            if not description and isinstance(content, dict):
-                description = content.get("title", "")
             
             # 提取帖子 ID
             post_id = data.get("post_id") or data.get("id") or "unknown"
@@ -341,7 +368,8 @@ class StreamManager:
                 "platform": platform,
                 "post_id": post_id,
                 "author": author_name,
-                "description": description[:200] if description else "",
+                "title": title[:200] if title else "",  # 新增：帖子标题
+                "description": description[:500] if description else "",
                 "content_url": content_url,
                 "cover_url": cover_url,
                 "timestamp": datetime.utcnow().isoformat(),
@@ -372,17 +400,23 @@ class StreamManager:
             
             # 智能存储：去重 + 更新 + 聚合计算
             try:
-                # 1. 存储/更新帖子数据（自动去重）
+                # 1. 存储/更新帖子数据（自动去重），包含单帖分数
                 is_new, prev_stats = smart_history_store.upsert_post(
                     platform=platform,
                     tag=hashtag.lstrip("#"),
                     post_id=post_id,
                     stats=crawl_item["stats"],
                     author=author_name,
+                    title=title[:200] if title else "",
                     description=description[:200] if description else "",
                     content_url=content_url,
                     cover_url=cover_url,
-                    post_created_at=data.get("created_at", "")
+                    post_created_at=data.get("created_at", ""),
+                    # 单帖分数
+                    trend_score=score_result.get("trend_score", 0),
+                    dimensions=result["dimensions"],
+                    lifecycle=score_result.get("lifecycle", "unknown"),
+                    priority=score_result.get("priority", "P3")
                 )
                 
                 # 2. 获取该 tag 的聚合数据（包含新鲜度）
@@ -455,24 +489,6 @@ class StreamManager:
                 
             except Exception as e:
                 logger.warning(f"Failed to smart store: {e}", exc_info=True)
-                # 回退到旧存储
-                try:
-                    history_store.add_record(
-                        platform=platform,
-                        hashtag=hashtag,
-                        trend_score=score_result.get("trend_score", 0),
-                        dimensions=result["dimensions"],
-                        raw_data=data,
-                        author=author_name,
-                        description=description[:200] if description else "",
-                        post_id=post_id,
-                        content_url=content_url,
-                        cover_url=cover_url,
-                        lifecycle=score_result.get("lifecycle", "unknown"),
-                        priority=score_result.get("priority", "P3")
-                    )
-                except Exception as e2:
-                    logger.warning(f"Fallback store also failed: {e2}")
             
             return result
         except Exception as e:
