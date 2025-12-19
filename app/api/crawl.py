@@ -89,15 +89,10 @@ async def run_crawler_task(tags: List[str], mock: bool = True):
             crawl_state.progress = 20
 
             try:
-                # 根据模式选择不同的端点
-                if mock:
-                    url = f"{SPIDER_SERVER_URL}/run/mock"
-                    payload = {}
-                    logger.info(f"Calling spider6p (Mock): POST {url}")
-                else:
-                    url = f"{SPIDER_SERVER_URL}/run/tags"
-                    payload = {"tags": tags}
-                    logger.info(f"Calling spider6p (Real): POST {url}")
+                # 统一调用 /run 端点，由爬虫端的 config.useMock 决定模式
+                url = f"{SPIDER_SERVER_URL}/run"
+                payload = {}
+                logger.info(f"Calling spider6p: POST {url}")
 
                 async with session.post(
                     url, json=payload, timeout=aiohttp.ClientTimeout(total=180)

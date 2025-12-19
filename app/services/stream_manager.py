@@ -275,7 +275,7 @@ class StreamManager:
                 title = content.get("title", "")
             if not title:
                 title = (
-                    data.get("title", "") or  # 通用
+                    data.get("title", "") or  # 通用 (Kafka 标准格式)
                     data.get("text", "") or   # Twitter
                     data.get("caption", "") or  # Instagram
                     data.get("name", "")  # Reddit
@@ -283,7 +283,16 @@ class StreamManager:
             # 从 rawData 中尝试获取
             raw_data_inner = data.get("rawData", {}) or data.get("raw", {})
             if not title and isinstance(raw_data_inner, dict):
-                title = raw_data_inner.get("title", "") or raw_data_inner.get("desc", "")
+                title = (
+                    raw_data_inner.get("title", "") or 
+                    raw_data_inner.get("desc", "") or
+                    raw_data_inner.get("text", "") or  # Twitter raw
+                    raw_data_inner.get("full_text", "")  # Twitter full_text
+                )
+            
+            # 调试日志
+            if platform.lower() == "twitter" and not title:
+                logger.warning(f"[DEBUG] Twitter post missing title. Keys: {list(data.keys())}, raw keys: {list(raw_data_inner.keys()) if isinstance(raw_data_inner, dict) else 'N/A'}")
             
             # 提取描述 (description) - 通常是更长的文本
             description = data.get("description", "")

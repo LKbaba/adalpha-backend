@@ -59,12 +59,21 @@ class HistoryStatsResponse(BaseModel):
 
 # === Helper Functions ===
 
+def _normalize_platform(platform: str) -> str:
+    """统一平台名称"""
+    p = platform.upper()
+    # Twitter -> X
+    if p == "TWITTER":
+        return "X"
+    return p
+
+
 def _post_to_record(post_data: dict, rank: int) -> dict:
     """将 post 数据转换为前端兼容格式"""
     return {
         "id": post_data["id"],
         "timestamp": post_data.get("last_updated_at", ""),
-        "platform": post_data["platform"].upper(),
+        "platform": _normalize_platform(post_data["platform"]),
         "hashtag": f"#{post_data['tag']}",
         "trend_score": post_data.get("trend_score", 0),
         "dimensions": post_data.get("dimensions", {}),
@@ -98,7 +107,7 @@ async def get_all_rankings(
     # 按平台分组
     rankings = {}
     for post in all_posts:
-        platform = post["platform"].upper()
+        platform = _normalize_platform(post["platform"])
         if platform not in rankings:
             rankings[platform] = {
                 "platform": platform,
