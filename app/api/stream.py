@@ -228,3 +228,68 @@ async def broadcast_test_message(
         "success": True,
         "message": f"Broadcasted to {stream_manager.client_count} clients"
     }
+
+
+@router.get("/kafka-debug")
+async def kafka_debug():
+    """
+    Debug Kafka connection and topic status.
+    """
+    from app.services.kafka_client import kafka_client
+    
+    try:
+        metadata = kafka_client.get_cluster_metadata(timeout=5.0)
+        return {
+            "kafka_connected": metadata.get("connected", False),
+            "cluster_id": metadata.get("cluster_id"),
+            "topics": metadata.get("topics", []),
+            "broker_count": metadata.get("broker_count", 0),
+            "stream_manager_running": stream_manager.is_running,
+            "sse_client_count": stream_manager.client_count,
+        }
+    except Exception as e:
+        return {
+            "kafka_connected": False,
+            "error": str(e),
+            "stream_manager_running": stream_manager.is_running,
+            "sse_client_count": stream_manager.client_count,
+        }
+
+
+@router.post("/test-vks")
+async def send_test_vks():
+    """
+    Send a test VKS update to all connected clients.
+    Useful for testing the SSE pipeline without Kafka.
+    """
+    import random
+    
+    if not stream_manager.is_running or stream_manager.client_count == 0:
+        return {
+            "success": False,
+            "message": "No clients connected"
+        }
+    
+    test_data = {
+        "hashtag": "#TestTrend",
+        "vks_score": random.uniform(30, 90),
+        "trend_score": random.uniform(30, 90),
+        "platform": random.choice(["TIKTOK", "TWITTER", "REDDIT", "YOUTUBE"]),
+        "source": "test_endpoint",
+        "dimensions": {
+            "H": random.uniform(0, 100),
+            "V": random.uniform(0, 100),
+            "D": random.uniform(0, 100),
+            "F": random.uniform(0, 100),
+            "M": random.uniform(0, 100),
+            "R": random.uniform(0, 100),
+        }
+    }
+    
+    stream_manager.broadcast("vks_update", test_data, "vks-scores")
+    
+    return {
+        "success": True,
+        "message": f"Test VKS sent to {stream_manager.client_count} clients",
+        "data": test_data
+    }

@@ -24,6 +24,7 @@ from confluent_kafka import Consumer, KafkaError
 from app.config import get_settings
 from app.services.kafka_client import kafka_client
 from app.services.adaptive_trend_scorer import adaptive_trend_scorer
+from app.services.history_store import history_store
 
 logger = logging.getLogger(__name__)
 
@@ -306,14 +307,14 @@ class StreamManager:
                 keyword=hashtag.lstrip("#")
             )
             
-            logger.debug(f"📊 Adaptive Trend Score - platform: {platform}, keyword: {hashtag}, "
+            logger.info(f"📊 Adaptive Trend Score - platform: {platform}, keyword: {hashtag}, "
                         f"trend_score: {score_result.get('trend_score')}, "
                         f"H={score_result.get('H')}, V={score_result.get('V')}, "
                         f"D={score_result.get('D')}, F={score_result.get('F')}, "
                         f"M={score_result.get('M')}, R={score_result.get('R')}")
             
-            # 返回完整的评分结果
-            return {
+            # 构建结果
+            result = {
                 "hashtag": hashtag,
                 "vks_score": score_result.get("trend_score", 0),  # 兼容旧字段名
                 "trend_score": score_result.get("trend_score", 0),
@@ -346,6 +347,26 @@ class StreamManager:
                     "saves": crawl_item["stats"].get("saves", 0),
                 })
             }
+            
+            # 存储到历史记录
+            try:
+                history_store.add_record(
+                    platform=platform,
+                    hashtag=hashtag,
+                    trend_score=score_result.get("trend_score", 0),
+                    dimensions=result["dimensions"],
+                    raw_data=data,
+                    author=author_name,
+                    description=description[:200] if description else "",
+                    post_id=post_id,
+                    lifecycle=score_result.get("lifecycle", "unknown"),
+                    priority=score_result.get("priority", "P3")
+                )
+                logger.info(f"📦 Stored to history: {platform}/{hashtag} score={score_result.get('trend_score', 0)}")
+            except Exception as e:
+                logger.warning(f"Failed to store history: {e}")
+            
+            return result
         except Exception as e:
             logger.error(f"Error calculating Trend Score from market data: {e}", exc_info=True)
             return {
@@ -420,15 +441,30 @@ class StreamManager:
                         except json.JSONDecodeError:
                             raw_data = {"raw": value}
                         
+                        # 🔍 调试：打印收到的数据结构
+                        data_type = raw_data.get("type", "NO_TYPE")
+                        data_keys = list(raw_data.keys())[:10]  # 前10个key
+                        logger.info(f"📥 market-stream data: type={data_type}, keys={data_keys}")
+                        
                         # 1. 发送原始 trend_update 事件
                         logger.info(f"📤 Broadcasting trend_update to {self.client_count} clients")
                         self.broadcast("trend_update", raw_data, topic)
                         
-                        # 2. 同时计算 VKS 并发送 vks_update 事件 (Flink fallback)
-                        if raw_data.get("type") == "social_post":
+                        # 2. 计算 VKS 并发送 vks_update 事件
+                        # 放宽条件：只要有 platform 或 hashtag 字段就处理
+                        has_social_data = (
+                            raw_data.get("type") == "social_post" or
+                            raw_data.get("platform") or
+                            raw_data.get("hashtag") or
+                            raw_data.get("tag")
+                        )
+                        
+                        if has_social_data:
                             vks_data = self._calculate_vks_from_market_data(raw_data)
-                            logger.info(f"📤 Broadcasting vks_update (calculated) to {self.client_count} clients: {vks_data}")
+                            logger.info(f"📤 Broadcasting vks_update (calculated) to {self.client_count} clients: hashtag={vks_data.get('hashtag')}, score={vks_data.get('trend_score')}")
                             self.broadcast("vks_update", vks_data, "vks-scores")
+                        else:
+                            logger.warning(f"⚠️ Skipping vks_update: no social data fields found in {data_keys}")
                     else:
                         value = msg.value().decode("utf-8")
                         try:
