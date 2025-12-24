@@ -143,7 +143,8 @@ class StreamManager:
             if client_id in self._clients:
                 logger.warning(f"Client {client_id} already registered, replacing")
 
-            queue = Queue(maxsize=100)  # Buffer up to 100 messages
+            # 增加队列容量，避免数据量大时消息丢失
+            queue = Queue(maxsize=500)  # Buffer up to 500 messages (原来是100)
             self._clients[client_id] = queue
             self._client_info[client_id] = SSEClient(
                 client_id=client_id,
@@ -573,27 +574,38 @@ class StreamManager:
                             raw_data = json.loads(value)
                         except json.JSONDecodeError:
                             raw_data = {"raw": value}
-                        
-                        # 🔍 调试：打印收到的数据结构
-                        data_type = raw_data.get("type", "NO_TYPE")
-                        data_keys = list(raw_data.keys())[:10]  # 前10个key
+
+                        # 🔧 修复：检查数据是否被 Kafka 中间件包装
+                        # 如果数据被包装，keys 会是 ['event_id', 'event_type', 'data', 'source', 'ingested_at']
+                        # 真正的社交数据藏在 'data' 字段里
+                        if 'data' in raw_data and isinstance(raw_data.get('data'), dict):
+                            # 数据被包装了，解包获取真实数据
+                            actual_data = raw_data['data']
+                            logger.info(f"📦 Unwrapped packaged data: event_type={raw_data.get('event_type')}, source={raw_data.get('source')}")
+                        else:
+                            # 数据未被包装，直接使用
+                            actual_data = raw_data
+
+                        # 🔍 调试：打印解包后的数据结构
+                        data_type = actual_data.get("type", "NO_TYPE")
+                        data_keys = list(actual_data.keys())[:10]  # 前10个key
                         logger.info(f"📥 market-stream data: type={data_type}, keys={data_keys}")
-                        
-                        # 1. 发送原始 trend_update 事件
+
+                        # 1. 发送原始 trend_update 事件（使用解包后的数据）
                         logger.info(f"📤 Broadcasting trend_update to {self.client_count} clients")
-                        self.broadcast("trend_update", raw_data, topic)
-                        
+                        self.broadcast("trend_update", actual_data, topic)
+
                         # 2. 计算 VKS 并发送 vks_update 事件
-                        # 放宽条件：只要有 platform 或 hashtag 字段就处理
+                        # 使用解包后的数据判断
                         has_social_data = (
-                            raw_data.get("type") == "social_post" or
-                            raw_data.get("platform") or
-                            raw_data.get("hashtag") or
-                            raw_data.get("tag")
+                            actual_data.get("type") == "social_post" or
+                            actual_data.get("platform") or
+                            actual_data.get("hashtag") or
+                            actual_data.get("tag")
                         )
-                        
+
                         if has_social_data:
-                            vks_data = self._calculate_vks_from_market_data(raw_data)
+                            vks_data = self._calculate_vks_from_market_data(actual_data)
                             logger.info(f"📤 Broadcasting vks_update (calculated) to {self.client_count} clients: hashtag={vks_data.get('hashtag')}, score={vks_data.get('trend_score')}")
                             self.broadcast("vks_update", vks_data, "vks-scores")
                         else:
