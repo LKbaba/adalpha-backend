@@ -6,6 +6,12 @@ Smart History Store - 智能历史数据存储服务
 2. 历史数据对比 - 自动计算增长率 (V 维度)
 3. Tag 级别聚合 - 同一 platform + tag 的数据聚合计算
 4. 热度衰减 - 长时间未更新的数据降低权重
+
+并发优化 (2025-12-24):
+- 使用 WAL 模式提升并发性能
+- 使用连接池避免频繁创建/销毁连接
+- 读操作无锁，写操作使用细粒度锁
+- 支持批量写入减少事务次数
 """
 
 import logging
@@ -13,6 +19,7 @@ import sqlite3
 import json
 import os
 import threading
+import queue
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Tuple
 from contextlib import contextmanager
@@ -26,34 +33,127 @@ RETENTION_HOURS = 2
 DB_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "data")
 DB_PATH = os.path.join(DB_DIR, "smart_history.db")
 
+# 连接池大小
+POOL_SIZE = 3
+
+
+class ConnectionPool:
+    """
+    简单的 SQLite 连接池
+
+    SQLite 在 WAL 模式下支持多个读连接和一个写连接并发
+    """
+
+    def __init__(self, db_path: str, pool_size: int = POOL_SIZE):
+        self._db_path = db_path
+        self._pool = queue.Queue(maxsize=pool_size)
+        self._pool_size = pool_size
+        self._lock = threading.Lock()
+        self._initialized = False
+
+    def _create_connection(self) -> sqlite3.Connection:
+        """创建一个新的数据库连接"""
+        conn = sqlite3.connect(
+            self._db_path,
+            timeout=30.0,
+            check_same_thread=False,  # 允许跨线程使用
+            isolation_level=None  # 自动提交模式，手动控制事务
+        )
+        conn.row_factory = sqlite3.Row
+        # 启用 WAL 模式 - 大幅提升并发性能
+        conn.execute("PRAGMA journal_mode=WAL")
+        # 设置同步模式为 NORMAL（平衡性能和安全）
+        conn.execute("PRAGMA synchronous=NORMAL")
+        # 增加缓存大小（默认 2000 页，约 8MB）
+        conn.execute("PRAGMA cache_size=4000")
+        # 启用外键约束
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
+
+    def initialize(self):
+        """初始化连接池"""
+        if self._initialized:
+            return
+        with self._lock:
+            if self._initialized:
+                return
+            for _ in range(self._pool_size):
+                conn = self._create_connection()
+                self._pool.put(conn)
+            self._initialized = True
+            logger.info(f"连接池已初始化: {self._pool_size} 个连接, WAL 模式已启用")
+
+    @contextmanager
+    def get_connection(self):
+        """获取一个连接（上下文管理器）"""
+        if not self._initialized:
+            self.initialize()
+
+        conn = None
+        try:
+            # 尝试从池中获取连接，最多等待 10 秒
+            conn = self._pool.get(timeout=10.0)
+            yield conn
+        except queue.Empty:
+            # 池中没有可用连接，创建临时连接
+            logger.warning("连接池已满，创建临时连接")
+            conn = self._create_connection()
+            yield conn
+            conn.close()  # 临时连接用完就关闭
+            conn = None
+        finally:
+            if conn is not None:
+                try:
+                    self._pool.put_nowait(conn)
+                except queue.Full:
+                    conn.close()
+
+    def close_all(self):
+        """关闭所有连接"""
+        while not self._pool.empty():
+            try:
+                conn = self._pool.get_nowait()
+                conn.close()
+            except queue.Empty:
+                break
+        self._initialized = False
+        logger.info("连接池已关闭")
+
 
 class SmartHistoryStore:
     """
     智能历史数据存储管理器
-    
+
     数据模型：
     1. posts 表 - 存储每个帖子的最新数据和历史快照
     2. tag_scores 表 - 存储每个 platform+tag 的聚合分数
+
+    并发优化：
+    - 使用连接池管理数据库连接
+    - WAL 模式支持读写并发
+    - 写操作使用锁，读操作无锁
     """
-    
+
     def __init__(self, db_path: str = DB_PATH, retention_hours: int = RETENTION_HOURS):
         self._db_path = db_path
         self._retention_hours = retention_hours
-        self._lock = threading.Lock()
+        self._write_lock = threading.Lock()  # 只用于写操作
         self._last_vacuum_time = datetime.utcnow()
-        
+
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
+
+        # 使用连接池
+        self._pool = ConnectionPool(db_path)
+        self._pool.initialize()
+
         self._init_db()
-        logger.info(f"SmartHistoryStore initialized: {db_path}")
-    
+        logger.info(f"SmartHistoryStore 已初始化: {db_path} (WAL 模式, 连接池)")
+
     @contextmanager
     def _get_connection(self):
-        conn = sqlite3.connect(self._db_path, timeout=30.0)
-        conn.row_factory = sqlite3.Row
-        try:
+        """获取数据库连接（从连接池）"""
+        with self._pool.get_connection() as conn:
             yield conn
-        finally:
-            conn.close()
     
     def _init_db(self):
         with self._get_connection() as conn:
@@ -186,77 +286,85 @@ class SmartHistoryStore:
         shares = stats.get("shares", 0) or 0
         saves = stats.get("saves", 0) or 0
         
-        with self._lock:
+        with self._write_lock:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                
-                # 检查是否已存在
-                cursor.execute(
-                    "SELECT views, likes, comments, shares, saves, update_count FROM posts WHERE id = ?",
-                    (unique_id,)
-                )
-                existing = cursor.fetchone()
-                
-                if existing:
-                    # 更新现有记录，保存当前值为 prev_*
-                    prev_stats = {
-                        "views": existing["views"],
-                        "likes": existing["likes"],
-                        "comments": existing["comments"],
-                        "shares": existing["shares"],
-                        "saves": existing["saves"]
-                    }
-                    
-                    cursor.execute("""
-                        UPDATE posts SET
-                            views = ?, likes = ?, comments = ?, shares = ?, saves = ?,
-                            prev_views = ?, prev_likes = ?, prev_comments = ?, prev_shares = ?, prev_saves = ?,
-                            author = COALESCE(NULLIF(?, ''), author),
-                            title = COALESCE(NULLIF(?, ''), title),
-                            description = COALESCE(NULLIF(?, ''), description),
-                            content_url = COALESCE(NULLIF(?, ''), content_url),
-                            cover_url = COALESCE(NULLIF(?, ''), cover_url),
-                            trend_score = ?,
-                            dimensions = ?,
-                            lifecycle = ?,
-                            priority = ?,
-                            last_updated_at = ?,
-                            update_count = update_count + 1
-                        WHERE id = ?
-                    """, (
-                        views, likes, comments, shares, saves,
-                        prev_stats["views"], prev_stats["likes"], prev_stats["comments"], 
-                        prev_stats["shares"], prev_stats["saves"],
-                        author, title, description, content_url, cover_url,
-                        trend_score, json.dumps(dimensions or {}), lifecycle, priority,
-                        now, unique_id
-                    ))
-                    conn.commit()
-                    
-                    logger.debug(f"Updated post: {unique_id}, update_count={existing['update_count']+1}")
-                    return False, prev_stats
-                else:
-                    # 插入新记录
-                    cursor.execute("""
-                        INSERT INTO posts 
-                        (id, platform, tag, post_id, author, title, description, content_url, cover_url,
-                         views, likes, comments, shares, saves,
-                         prev_views, prev_likes, prev_comments, prev_shares, prev_saves,
-                         trend_score, dimensions, lifecycle, priority,
-                         first_seen_at, last_updated_at, post_created_at, update_count)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, ?, ?, ?, ?, ?, ?, ?, 1)
-                    """, (
-                        unique_id, platform.lower(), tag.lower().lstrip("#"), post_id,
-                        author, title[:200] if title else "", description[:500] if description else "", 
-                        content_url, cover_url,
-                        views, likes, comments, shares, saves,
-                        trend_score, json.dumps(dimensions or {}), lifecycle, priority,
-                        now, now, post_created_at
-                    ))
-                    conn.commit()
-                    
-                    logger.debug(f"Inserted new post: {unique_id}")
-                    return True, None
+
+                # 开始事务（WAL 模式下更高效）
+                cursor.execute("BEGIN IMMEDIATE")
+
+                try:
+                    # 检查是否已存在
+                    cursor.execute(
+                        "SELECT views, likes, comments, shares, saves, update_count FROM posts WHERE id = ?",
+                        (unique_id,)
+                    )
+                    existing = cursor.fetchone()
+
+                    if existing:
+                        # 更新现有记录，保存当前值为 prev_*
+                        prev_stats = {
+                            "views": existing["views"],
+                            "likes": existing["likes"],
+                            "comments": existing["comments"],
+                            "shares": existing["shares"],
+                            "saves": existing["saves"]
+                        }
+
+                        cursor.execute("""
+                            UPDATE posts SET
+                                views = ?, likes = ?, comments = ?, shares = ?, saves = ?,
+                                prev_views = ?, prev_likes = ?, prev_comments = ?, prev_shares = ?, prev_saves = ?,
+                                author = COALESCE(NULLIF(?, ''), author),
+                                title = COALESCE(NULLIF(?, ''), title),
+                                description = COALESCE(NULLIF(?, ''), description),
+                                content_url = COALESCE(NULLIF(?, ''), content_url),
+                                cover_url = COALESCE(NULLIF(?, ''), cover_url),
+                                trend_score = ?,
+                                dimensions = ?,
+                                lifecycle = ?,
+                                priority = ?,
+                                last_updated_at = ?,
+                                update_count = update_count + 1
+                            WHERE id = ?
+                        """, (
+                            views, likes, comments, shares, saves,
+                            prev_stats["views"], prev_stats["likes"], prev_stats["comments"],
+                            prev_stats["shares"], prev_stats["saves"],
+                            author, title, description, content_url, cover_url,
+                            trend_score, json.dumps(dimensions or {}), lifecycle, priority,
+                            now, unique_id
+                        ))
+                        cursor.execute("COMMIT")
+
+                        logger.debug(f"Updated post: {unique_id}, update_count={existing['update_count']+1}")
+                        return False, prev_stats
+                    else:
+                        # 插入新记录
+                        cursor.execute("""
+                            INSERT INTO posts
+                            (id, platform, tag, post_id, author, title, description, content_url, cover_url,
+                             views, likes, comments, shares, saves,
+                             prev_views, prev_likes, prev_comments, prev_shares, prev_saves,
+                             trend_score, dimensions, lifecycle, priority,
+                             first_seen_at, last_updated_at, post_created_at, update_count)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, ?, ?, ?, ?, ?, ?, ?, 1)
+                        """, (
+                            unique_id, platform.lower(), tag.lower().lstrip("#"), post_id,
+                            author, title[:200] if title else "", description[:500] if description else "",
+                            content_url, cover_url,
+                            views, likes, comments, shares, saves,
+                            trend_score, json.dumps(dimensions or {}), lifecycle, priority,
+                            now, now, post_created_at
+                        ))
+                        cursor.execute("COMMIT")
+
+                        logger.debug(f"Inserted new post: {unique_id}")
+                        return True, None
+                except Exception as e:
+                    cursor.execute("ROLLBACK")
+                    logger.error(f"upsert_post 失败: {e}")
+                    raise
     
     def get_tag_aggregated_stats(
         self,
@@ -388,13 +496,13 @@ class SmartHistoryStore:
         activity_level = aggregated_stats.get("activity_level", "unknown")
         new_posts = aggregated_stats.get("new_posts", 0)
         
-        with self._lock:
+        with self._write_lock:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                
+
                 cursor.execute("""
-                    INSERT INTO tag_scores 
-                    (id, platform, tag, 
+                    INSERT INTO tag_scores
+                    (id, platform, tag,
                      total_views, total_likes, total_comments, total_shares, total_saves, post_count,
                      prev_total_views, prev_total_likes, prev_total_comments, prev_total_shares, prev_total_saves,
                      trend_score, dimensions, lifecycle, priority,
@@ -710,14 +818,115 @@ class SmartHistoryStore:
     
     def clear_all(self):
         """清空所有数据（谨慎使用）"""
-        with self._lock:
+        with self._write_lock:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("DELETE FROM posts")
                 cursor.execute("DELETE FROM tag_scores")
-                conn.commit()
                 conn.execute("VACUUM")
                 logger.warning("All smart history data cleared")
+
+    def close(self):
+        """关闭连接池（程序退出时调用）"""
+        self._pool.close_all()
+
+    def batch_upsert_posts(
+        self,
+        posts_data: List[Dict[str, Any]]
+    ) -> Tuple[int, int]:
+        """
+        批量插入或更新帖子数据（高性能批量操作）
+
+        Args:
+            posts_data: 帖子数据列表，每个元素包含:
+                - platform, tag, post_id, stats, author, title, description,
+                - content_url, cover_url, post_created_at, trend_score,
+                - dimensions, lifecycle, priority
+
+        Returns:
+            (new_count, updated_count): 新增数量和更新数量
+        """
+        if not posts_data:
+            return 0, 0
+
+        now = datetime.utcnow().isoformat()
+        new_count = 0
+        updated_count = 0
+
+        with self._write_lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("BEGIN IMMEDIATE")
+
+                try:
+                    for data in posts_data:
+                        platform = data.get("platform", "unknown")
+                        post_id = data.get("post_id", "")
+                        unique_id = f"{platform}:{post_id}"
+
+                        stats = data.get("stats", {})
+                        views = stats.get("views", 0) or 0
+                        likes = stats.get("likes", 0) or 0
+                        comments = stats.get("comments", 0) or 0
+                        shares = stats.get("shares", 0) or 0
+                        saves = stats.get("saves", 0) or 0
+
+                        # 检查是否已存在
+                        cursor.execute(
+                            "SELECT id FROM posts WHERE id = ?",
+                            (unique_id,)
+                        )
+                        existing = cursor.fetchone()
+
+                        tag = data.get("tag", "").lower().lstrip("#")
+                        author = data.get("author", "")
+                        title = data.get("title", "")[:200] if data.get("title") else ""
+                        description = data.get("description", "")[:500] if data.get("description") else ""
+                        content_url = data.get("content_url", "")
+                        cover_url = data.get("cover_url", "")
+                        trend_score = data.get("trend_score", 0)
+                        dimensions = json.dumps(data.get("dimensions", {}))
+                        lifecycle = data.get("lifecycle", "unknown")
+                        priority = data.get("priority", "P3")
+                        post_created_at = data.get("post_created_at", "")
+
+                        if existing:
+                            # 更新
+                            cursor.execute("""
+                                UPDATE posts SET
+                                    prev_views = views, prev_likes = likes,
+                                    prev_comments = comments, prev_shares = shares, prev_saves = saves,
+                                    views = ?, likes = ?, comments = ?, shares = ?, saves = ?,
+                                    trend_score = ?, dimensions = ?, lifecycle = ?, priority = ?,
+                                    last_updated_at = ?, update_count = update_count + 1
+                                WHERE id = ?
+                            """, (views, likes, comments, shares, saves,
+                                  trend_score, dimensions, lifecycle, priority, now, unique_id))
+                            updated_count += 1
+                        else:
+                            # 插入
+                            cursor.execute("""
+                                INSERT INTO posts
+                                (id, platform, tag, post_id, author, title, description,
+                                 content_url, cover_url, views, likes, comments, shares, saves,
+                                 prev_views, prev_likes, prev_comments, prev_shares, prev_saves,
+                                 trend_score, dimensions, lifecycle, priority,
+                                 first_seen_at, last_updated_at, post_created_at, update_count)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, ?, ?, ?, ?, ?, ?, ?, 1)
+                            """, (unique_id, platform.lower(), tag, post_id, author, title, description,
+                                  content_url, cover_url, views, likes, comments, shares, saves,
+                                  trend_score, dimensions, lifecycle, priority, now, now, post_created_at))
+                            new_count += 1
+
+                    cursor.execute("COMMIT")
+                    logger.info(f"批量写入完成: {new_count} 新增, {updated_count} 更新")
+
+                except Exception as e:
+                    cursor.execute("ROLLBACK")
+                    logger.error(f"批量写入失败: {e}")
+                    raise
+
+        return new_count, updated_count
 
 
 # 全局单例
