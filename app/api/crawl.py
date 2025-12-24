@@ -2,9 +2,13 @@
 Crawl API Endpoints - 爬虫触发接口
 
 提供手动触发爬虫的 API，支持前端在加载页面时触发爬取流程。
-通过调用 spider6p 服务器 (http://localhost:8001) 来执行爬取。
+通过调用 spider6p 服务器来执行爬取。
+
+环境变量:
+- SPIDER_SERVER_URL: 爬虫服务器地址（默认 http://localhost:8001）
 """
 
+import os
 import logging
 import asyncio
 import aiohttp
@@ -17,8 +21,10 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/crawl", tags=["Crawler Control"])
 
-# Spider6P 服务器地址
-SPIDER_SERVER_URL = "http://localhost:8001"
+# Spider6P 服务器地址 - 从环境变量读取，支持云部署
+# 本地开发: http://localhost:8001
+# 阿里云服务器: http://47.101.161.15:8001
+SPIDER_SERVER_URL = os.getenv("SPIDER_SERVER_URL", "http://localhost:8001")
 
 
 # === State ===
